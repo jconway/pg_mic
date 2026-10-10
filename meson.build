@@ -37,4 +37,10 @@ tests += {
       'pg_mic',
     ],
   },
+  'tap': {
+    'tests': [
+      't/001_preload.pl',
+      't/002_modes.pl',
+    ],
+  },
 }

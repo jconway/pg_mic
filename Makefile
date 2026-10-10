@@ -14,6 +14,7 @@ DATA = pg_mic--1.0.sql
 PGFILEDESC = "pg_mic - Biba mandatory integrity model"
 
 REGRESS = pg_mic
+TAP_TESTS = 1
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
