@@ -263,7 +263,7 @@ SELECT current_setting('server_version_num')::int >= 180000 AS pg18plus \gset
 -- built-in expression is possible; it must remain usable by a HIGH subject)
 CREATE TABLE r_gv (id int, g int GENERATED ALWAYS AS (id * 2) VIRTUAL);
 INSERT INTO r_gv (id) VALUES (1);
-SELECT g FROM r_gv;
+SELECT g FROM r_gv \gset
 DROP TABLE r_gv;
 \endif
 

@@ -234,12 +234,13 @@ mic_raw_func_walker(Node *node, RawFuncCtx *ctx)
 	if (IsA(node, FuncCall))
 	{
 		FuncCall   *fc = (FuncCall *) node;
+#if PG_VERSION_NUM >= 190000
 		int			fgc_flags = 0;
+#endif
 		FuncCandidateList cands;
 
 		/* never errors on ambiguity; skip unless exactly one candidate */
-		cands = FuncnameGetCandidates(fc->funcname, -1, NIL, false, false,
-									  false, true, &fgc_flags);
+		cands = MIC_FUNCNAME_GET_CANDIDATES(fc->funcname);
 		if (cands != NULL && cands->next == NULL)
 			mic_check_one_function(cands->oid, ctx->subject_level,
 								   ctx->what, ctx->objname);

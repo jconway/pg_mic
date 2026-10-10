@@ -27,6 +27,8 @@ StaticAssertDecl(PG_VERSION_NUM >= 140000,
 	PG_MODULE_MAGIC_EXT(.name = "pg_mic", .version = PG_VERSION)
 #else
 #define MIC_MODULE_MAGIC PG_MODULE_MAGIC
+/* fmgr.h declares _PG_init only from PG18 on; avoid -Wmissing-prototypes */
+extern PGDLLEXPORT void _PG_init(void);
 #endif
 
 typedef struct MicPermEntry
@@ -53,6 +55,18 @@ typedef struct MicPermEntry
 	mic_perm_entries((rangeTabls), NIL)
 #define MIC_CALL_NEXT_CHECKPERMS(next, rangeTabls, rteperminfos, abort) \
 	(*(next)) ((rangeTabls), (abort))
+#endif
+
+/*
+ * FuncnameGetCandidates() gained a trailing int *fgc_flags argument in PG19.
+ */
+#if PG_VERSION_NUM >= 190000
+#define MIC_FUNCNAME_GET_CANDIDATES(names) \
+	FuncnameGetCandidates((names), -1, NIL, false, false, false, true, \
+						  &fgc_flags)
+#else
+#define MIC_FUNCNAME_GET_CANDIDATES(names) \
+	FuncnameGetCandidates((names), -1, NIL, false, false, false, true)
 #endif
 
 /* Defined in dml.c.  Returns List* of MicPermEntry*. */
