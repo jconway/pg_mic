@@ -386,7 +386,19 @@ REINDEX INDEX r_ixr_e;                                               -- denied
 REINDEX TABLE r_ixr;                                                 -- denied
 
 -- ============================================================
+-- Utility path: ALTER TABLE ADD CONSTRAINT validating existing rows
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_atchk(int) RETURNS boolean AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+RESET ROLE;
+CREATE TABLE r_at (id int);
+INSERT INTO r_at VALUES (1);
+ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
+ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
+
 -- Cleanup
+DROP TABLE r_at;
+DROP FUNCTION public.low_atchk(int);
 -- ============================================================
 DROP TABLE r_ixb;
 DROP TABLE r_idx_builtin;

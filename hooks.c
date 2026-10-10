@@ -223,6 +223,7 @@ typedef struct RawFuncCtx
 {
 	int			subject_level;
 	const char *objname;
+	const char *what;
 } RawFuncCtx;
 
 static bool
@@ -241,7 +242,7 @@ mic_raw_func_walker(Node *node, RawFuncCtx *ctx)
 									  false, true, &fgc_flags);
 		if (cands != NULL && cands->next == NULL)
 			mic_check_one_function(cands->oid, ctx->subject_level,
-								   "index definition on", ctx->objname);
+								   ctx->what, ctx->objname);
 	}
 	return raw_expression_tree_walker(node, mic_raw_func_walker, ctx);
 }
@@ -302,6 +303,7 @@ mic_utility_command(PlannedStmt *pstmt,
 
 						ctx.subject_level = lvl;
 						ctx.objname = is->relation->relname;
+						ctx.what = "index definition on";
 						foreach(lc, is->indexParams)
 						{
 							IndexElem  *ie = lfirst_node(IndexElem, lc);
@@ -311,6 +313,68 @@ mic_utility_command(PlannedStmt *pstmt,
 						}
 						if (is->whereClause)
 							(void) mic_raw_func_walker(is->whereClause, &ctx);
+					}
+					break;
+				}
+			case T_AlterTableStmt:
+				{
+					AlterTableStmt *at = (AlterTableStmt *) parsetree;
+					Oid			relid = RangeVarGetRelid(at->relation,
+														 AccessShareLock,
+														 true);
+					ListCell   *lc;
+
+					if (!OidIsValid(relid))
+						break;
+
+					foreach(lc, at->cmds)
+					{
+						AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+						switch (cmd->subtype)
+						{
+							case AT_AddConstraint:
+							case AT_ValidateConstraint:
+							case AT_AlterColumnType:
+							case AT_ColumnDefault:
+							case AT_CookedColumnDefault:
+							case AT_AddIdentity:
+#if PG_VERSION_NUM >= 180000
+							case AT_SetExpression:
+#endif
+								{
+									int			lvl = mic_get_subject_level();
+
+									if (cmd->def != NULL && lvl > MIC_LEVEL_LOW)
+									{
+										RawFuncCtx	ctx;
+
+										ctx.subject_level = lvl;
+										ctx.objname = at->relation->relname;
+										ctx.what = "ALTER TABLE on";
+										if (IsA(cmd->def, Constraint))
+											(void) mic_raw_func_walker(((Constraint *) cmd->def)->raw_expr, &ctx);
+										else if (IsA(cmd->def, ColumnDef))
+										{
+											ColumnDef  *cd = (ColumnDef *) cmd->def;
+											ListCell   *lc2;
+
+											(void) mic_raw_func_walker(cd->raw_default, &ctx);
+											foreach(lc2, cd->constraints)
+											{
+												Constraint *c = lfirst_node(Constraint, lc2);
+
+												(void) mic_raw_func_walker(c->raw_expr, &ctx);
+											}
+										}
+									}
+									mic_check_reachable_functions(relid,
+																  ACL_INSERT | ACL_UPDATE);
+								}
+								break;
+							default:
+								break;
+						}
 					}
 					break;
 				}

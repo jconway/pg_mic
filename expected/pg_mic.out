@@ -540,7 +540,19 @@ ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integ
 REINDEX TABLE r_ixr;                                                 -- denied
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "ixr_fn" reached via index expression on "r_ixr"
 -- ============================================================
+-- Utility path: ALTER TABLE ADD CONSTRAINT validating existing rows
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_atchk(int) RETURNS boolean AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+RESET ROLE;
+CREATE TABLE r_at (id int);
+INSERT INTO r_at VALUES (1);
+ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_atchk" reached via ALTER TABLE on "r_at"
+ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
 -- Cleanup
+DROP TABLE r_at;
+DROP FUNCTION public.low_atchk(int);
 -- ============================================================
 DROP TABLE r_ixb;
 DROP TABLE r_idx_builtin;
