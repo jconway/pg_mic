@@ -13,6 +13,8 @@
 
 #include "catalog/objectaddress.h"
 #include "fmgr.h"
+#include "nodes/nodes.h"
+#include "utils/acl.h"
 
 /*
  * Provider name used in pg_seclabel / pg_shseclabel
@@ -67,6 +69,15 @@ extern void mic_check_readwrite(Oid classId, Oid objectId);
  * dml.c
  */
 extern bool mic_dml_privileges(List *perm_entries, bool abort_on_violation);
+
+/*
+ * reach.c
+ */
+extern void mic_check_reachable_functions(Oid relid, AclMode required_ops);
+extern void mic_check_expr_functions(Node *expr, int subject_level,
+									  const char *via, const char *objname);
+extern void mic_check_one_function(Oid funcid, int subject_level,
+									const char *via, const char *objname);
 
 /*
  * promote.c -- SQL-callable functions declared via PG_FUNCTION_INFO_V1

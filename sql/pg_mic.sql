@@ -179,11 +179,43 @@ SELECT mic_promote_table('mic_test_low', 'high');
 RESET ROLE;
 
 -- ============================================================
+-- Reachable-function enforcement: CHECK constraints
+-- ============================================================
+GRANT CREATE, USAGE ON SCHEMA public TO mic_low_user;
+SET ROLE mic_low_user;
+-- inlinable SQL function (would be inlined away at runtime)
+CREATE FUNCTION public.low_sql_chk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+RESET ROLE;
+CREATE TABLE r_chk (id int CHECK (public.low_sql_chk(id)));
+-- HIGH subject INSERT must be denied (CHECK reaches a LOW function)
+INSERT INTO r_chk VALUES (1);
+-- a built-in-only CHECK must still work for HIGH
+CREATE TABLE r_chk_ok (id int CHECK (id >= 0));
+INSERT INTO r_chk_ok VALUES (1);
+-- a HIGH helper in a CHECK must work for HIGH
+CREATE FUNCTION public.high_chk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;  -- created by superuser => HIGH
+CREATE TABLE r_chk_hi (id int CHECK (public.high_chk(id)));
+INSERT INTO r_chk_hi VALUES (1);
+-- LOW subject fast path: a LOW user inserting is never denied by reachability
+GRANT INSERT ON r_chk_ok TO mic_low_user;
+SET ROLE mic_low_user;
+INSERT INTO r_chk_ok VALUES (2);
+RESET ROLE;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_chk;
+DROP TABLE r_chk_ok;
+DROP TABLE r_chk_hi;
+DROP FUNCTION public.low_sql_chk(int);
+DROP FUNCTION public.high_chk(int);
 DROP TABLE mic_test_high;
 DROP TABLE mic_test_medium;
 DROP TABLE mic_test_low;
+REVOKE CREATE, USAGE ON SCHEMA public FROM mic_low_user;
 DROP ROLE mic_high_user;
 DROP ROLE mic_medium_user;
 DROP ROLE mic_low_user;

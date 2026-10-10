@@ -7,6 +7,7 @@ OBJS = \
 	enforce.o \
 	hooks.o \
 	label.o \
+	reach.o \
 	promote.o
 EXTENSION = pg_mic
 DATA = pg_mic--1.0.sql

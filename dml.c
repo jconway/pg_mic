@@ -126,6 +126,7 @@ mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 					mic_check_read(RelationRelationId, relOid);
 				else
 					mic_check_write(RelationRelationId, relOid);
+				mic_check_reachable_functions(relOid, perminfo->requiredPerms);
 			}
 			PG_CATCH();
 			{
@@ -142,6 +143,7 @@ mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 				mic_check_read(RelationRelationId, relOid);
 			else
 				mic_check_write(RelationRelationId, relOid);
+			mic_check_reachable_functions(relOid, perminfo->requiredPerms);
 		}
 	}
 

@@ -6,6 +6,7 @@ pg_mic_sources = files(
   'hooks.c',
   'label.c',
   'promote.c',
+  'reach.c',
 )
 
 if host_system == 'windows'
