@@ -288,8 +288,22 @@ SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
 SELECT count(*) FROM r_idxp;           -- denied: planner evaluates predicate
 
 -- ============================================================
+-- Reachable-function enforcement: domain CHECK (type-level)
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_domchk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+CREATE DOMAIN public.low_dom AS int CHECK (public.low_domchk(VALUE));
+RESET ROLE;
+CREATE TABLE r_dom (id public.low_dom);
+INSERT INTO r_dom VALUES (1);          -- denied: domain CHECK reaches LOW fn
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_dom;
+DROP DOMAIN public.low_dom;
+DROP FUNCTION public.low_domchk(int);
 DROP TABLE r_idx;
 DROP TABLE r_idxp;
 DROP FUNCTION public.low_ident(int);

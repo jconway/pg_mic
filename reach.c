@@ -22,6 +22,11 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_type.h"
+#include "access/skey.h"
+#include "utils/fmgroids.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "commands/trigger.h"
@@ -31,6 +36,8 @@
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
 #include "utils/acl.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -345,6 +352,119 @@ check_index_exprs(Relation rel, int subject_level)
 	list_free(indexoids);
 }
 
+/* Domain CHECK constraints for domain-typed columns (run on write). */
+static void
+check_domain_of_type(Oid typid, int subject_level, const char *relname)
+{
+	Relation	conrel;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (get_typtype(typid) != TYPTYPE_DOMAIN)
+		return;
+
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_constraint_contypid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(typid));
+	scan = systable_beginscan(conrel, ConstraintTypidIndexId, true,
+							  NULL, 1, &skey);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(tup);
+		Datum		val;
+		bool		isnull;
+
+		if (c->contype != CONSTRAINT_CHECK)
+			continue;
+		val = heap_getattr(tup, Anum_pg_constraint_conbin,
+						   RelationGetDescr(conrel), &isnull);
+		if (isnull)
+		{
+			ereport(mic_is_enforcing() ? ERROR : WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("pg_mic: cannot analyze domain constraint on \"%s\"",
+							relname)));
+			continue;
+		}
+		mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
+								 subject_level, "domain CHECK on", relname);
+	}
+	systable_endscan(scan);
+	table_close(conrel, AccessShareLock);
+}
+
+static void
+check_domain_checks(Relation rel, int subject_level)
+{
+	TupleDesc	td = RelationGetDescr(rel);
+	int			i;
+
+	for (i = 0; i < td->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(td, i);
+
+		if (att->attisdropped)
+			continue;
+		check_domain_of_type(att->atttypid, subject_level,
+							 RelationGetRelationName(rel));
+	}
+}
+
+/* Exclusion-constraint operators: each operator's function runs on write. */
+static void
+check_exclusion_ops(Relation rel, int subject_level)
+{
+	Relation	conrel;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+							  NULL, 1, &skey);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(tup);
+		Datum		val;
+		bool		isnull;
+		ArrayType  *arr;
+		Oid		   *ops;
+		int			nops;
+		int			i;
+
+		if (c->contype != CONSTRAINT_EXCLUSION)
+			continue;
+		val = heap_getattr(tup, Anum_pg_constraint_conexclop,
+						   RelationGetDescr(conrel), &isnull);
+		if (isnull)
+		{
+			ereport(mic_is_enforcing() ? ERROR : WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("pg_mic: cannot analyze exclusion constraint on \"%s\"",
+							RelationGetRelationName(rel))));
+			continue;
+		}
+		arr = DatumGetArrayTypeP(val);	/* conexclop is oid[] */
+		nops = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+		ops = (Oid *) ARR_DATA_PTR(arr);
+		for (i = 0; i < nops; i++)
+		{
+			RegProcedure opfn = get_opcode(ops[i]);
+
+			if (OidIsValid(opfn))
+				mic_check_one_function(opfn, subject_level,
+									   "exclusion operator on",
+									   RelationGetRelationName(rel));
+		}
+	}
+	systable_endscan(scan);
+	table_close(conrel, AccessShareLock);
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {
@@ -371,7 +491,12 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 	check_triggers(rel, subject_level, required_ops);
 	check_defaults_and_generated(rel, subject_level, required_ops);
 	check_index_exprs(rel, subject_level);	/* all ops: planner evaluates too */
-	/* subsequent tasks add: excl, RLS, domain */
+	if (need_write)
+	{
+		check_domain_checks(rel, subject_level);
+		check_exclusion_ops(rel, subject_level);
+	}
+	/* subsequent tasks add: RLS */
 
 	table_close(rel, AccessShareLock);
 }
