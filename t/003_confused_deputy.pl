@@ -55,13 +55,41 @@ my ($rc, $out, $err) = $node->psql('postgres',
 isnt($rc, 0, 'HIGH subject touching LOW-trapped table fails');
 like($err, qr/pg_mic: .*denied/, 'denied by pg_mic');
 
+sub lo_len
+{
+	my $len = $node->safe_psql('postgres', q{
+		SET ROLE joe;
+		SELECT octet_length(loread(lo_open((SELECT last_value FROM public.poc_exfil_oid)::oid, 262144), 1000000));
+	});
+	$len =~ s/^\s+|\s+$//g;
+	return (split /\n/, $len)[-1];
+}
+
 # nothing exfiltrated
-my $len = $node->safe_psql('postgres', q{
-	SET ROLE joe;
-	SELECT octet_length(loread(lo_open((SELECT last_value FROM public.poc_exfil_oid)::oid, 262144), 1000000));
-});
-$len =~ s/^\s+|\s+$//g;
-$len = (split /\n/, $len)[-1];
-is($len, '0', 'zero bytes exfiltrated');
+is(lo_len(), '0', 'zero bytes exfiltrated');
+
+# CONTROL: with enforcement disabled the same attack must succeed
+$node->safe_psql('postgres',
+	"ALTER SYSTEM SET mic.mode = 'disabled'; SELECT pg_reload_conf();");
+my $ok = 0;
+for (1 .. 100)
+{
+	if ($node->safe_psql('postgres', 'SHOW mic.mode;') eq 'disabled')
+	{
+		$ok = 1;
+		last;
+	}
+	select(undef, undef, undef, 0.1);
+}
+ok($ok, 'mic.mode is now disabled');
+
+($rc, $out, $err) = $node->psql('postgres',
+	q{SELECT 1 FROM public.poc_shared_data LIMIT 1;});
+is($rc, 0, 'disabled: superuser SELECT succeeds');
+cmp_ok(lo_len(), '>', 0, 'control: attack exfiltrates when pg_mic is disabled');
+
+# restore enforcing
+$node->safe_psql('postgres',
+	"ALTER SYSTEM SET mic.mode = 'enforcing'; SELECT pg_reload_conf();");
 
 done_testing();
