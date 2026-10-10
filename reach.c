@@ -318,6 +318,33 @@ check_defaults_and_generated(Relation rel, int subject_level, AclMode required_o
 	}
 }
 
+static void
+check_index_exprs(Relation rel, int subject_level)
+{
+	List	   *indexoids = RelationGetIndexList(rel);
+	ListCell   *lc;
+
+	foreach(lc, indexoids)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+		List	   *exprs = RelationGetIndexExpressions(irel);
+		List	   *pred = RelationGetIndexPredicate(irel);
+		ListCell   *l2;
+
+		foreach(l2, exprs)
+			mic_check_expr_functions((Node *) lfirst(l2), subject_level,
+									 "index expression on",
+									 RelationGetRelationName(rel));
+		foreach(l2, pred)
+			mic_check_expr_functions((Node *) lfirst(l2), subject_level,
+									 "index predicate on",
+									 RelationGetRelationName(rel));
+		index_close(irel, AccessShareLock);
+	}
+	list_free(indexoids);
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {
@@ -343,7 +370,8 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 		check_check_constraints(rel, subject_level);
 	check_triggers(rel, subject_level, required_ops);
 	check_defaults_and_generated(rel, subject_level, required_ops);
-	/* subsequent tasks add: index, excl, RLS, domain */
+	check_index_exprs(rel, subject_level);	/* all ops: planner evaluates too */
+	/* subsequent tasks add: excl, RLS, domain */
 
 	table_close(rel, AccessShareLock);
 }

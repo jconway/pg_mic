@@ -268,8 +268,32 @@ DROP TABLE r_gv;
 \endif
 
 -- ============================================================
+-- Reachable-function enforcement: index expressions / predicates
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_ident(int) RETURNS int AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+RESET ROLE;
+CREATE TABLE r_idx (id int);
+CREATE INDEX r_idx_e ON r_idx (public.low_ident(id));
+INSERT INTO r_idx VALUES (1);          -- denied: index maintenance
+-- partial-index predicate evaluated by planner on SELECT (scratch.txt vector)
+-- (index creation itself evaluates the predicate and is denied for a LOW
+-- function, so build the index with a HIGH function, then demote it)
+CREATE FUNCTION public.high_ident(int) RETURNS int AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE r_idxp (id int);
+CREATE INDEX r_idxp_p ON r_idxp (id) WHERE public.high_ident(id) > 0;
+SELECT count(*) FROM r_idxp;           -- allowed: predicate function is HIGH
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.high_ident(int)'::regprocedure::oid, 'low');
+SELECT count(*) FROM r_idxp;           -- denied: planner evaluates predicate
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_idx;
+DROP TABLE r_idxp;
+DROP FUNCTION public.low_ident(int);
+DROP FUNCTION public.high_ident(int);
 DROP TABLE r_def;
 DROP TABLE r_gs;
 DROP FUNCTION public.low_def();
