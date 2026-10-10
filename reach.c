@@ -17,6 +17,8 @@
 #include "access/genam.h"
 #include "access/table.h"
 #include "access/transam.h"
+#include "access/htup_details.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "miscadmin.h"
@@ -28,11 +30,44 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/syscache.h"
+#include "utils/typcache.h"
 
 typedef struct FuncCollectCtx
 {
 	List	   *funcids;
 } FuncCollectCtx;
+
+static void
+collect_oid(FuncCollectCtx *ctx, Oid f)
+{
+	if (OidIsValid(f))
+		ctx->funcids = lappend_oid(ctx->funcids, f);
+}
+
+/* Collect an aggregate's own function plus its support functions. */
+static void
+collect_aggregate(FuncCollectCtx *ctx, Oid aggfnoid)
+{
+	HeapTuple	tup;
+
+	collect_oid(ctx, aggfnoid);
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_aggregate agg = (Form_pg_aggregate) GETSTRUCT(tup);
+
+		collect_oid(ctx, agg->aggtransfn);
+		collect_oid(ctx, agg->aggfinalfn);
+		collect_oid(ctx, agg->aggcombinefn);
+		collect_oid(ctx, agg->aggserialfn);
+		collect_oid(ctx, agg->aggdeserialfn);
+		collect_oid(ctx, agg->aggmtransfn);
+		collect_oid(ctx, agg->aggminvtransfn);
+		collect_oid(ctx, agg->aggmfinalfn);
+		ReleaseSysCache(tup);
+	}
+}
 
 static bool
 func_collect_walker(Node *node, FuncCollectCtx *ctx)
@@ -65,12 +100,35 @@ func_collect_walker(Node *node, FuncCollectCtx *ctx)
 				break;
 			}
 		case T_Aggref:
-			ctx->funcids = lappend_oid(ctx->funcids,
-									   ((Aggref *) node)->aggfnoid);
+			collect_aggregate(ctx, ((Aggref *) node)->aggfnoid);
 			break;
 		case T_WindowFunc:
-			ctx->funcids = lappend_oid(ctx->funcids,
-									   ((WindowFunc *) node)->winfnoid);
+			collect_aggregate(ctx, ((WindowFunc *) node)->winfnoid);
+			break;
+		case T_RowCompareExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((RowCompareExpr *) node)->opnos)
+					collect_oid(ctx, get_opcode(lfirst_oid(lc)));
+				break;
+			}
+		case T_MinMaxExpr:
+			{
+				TypeCacheEntry *tce;
+
+				tce = lookup_type_cache(((MinMaxExpr *) node)->minmaxtype,
+										TYPECACHE_CMP_PROC);
+				collect_oid(ctx, tce->cmp_proc);
+				break;
+			}
+		case T_SubscriptingRef:
+			collect_oid(ctx,
+						get_typsubscript(((SubscriptingRef *) node)->refcontainertype,
+										 NULL));
+			break;
+		case T_XmlExpr:
+			/* xml functions are all built-in: nothing to collect */
 			break;
 		case T_CoerceViaIO:
 			{
@@ -100,29 +158,33 @@ mic_check_one_function(Oid funcid, int subject_level,
 					   const char *via, const char *objname)
 {
 	int			objlevel;
+	char	   *fname;
 
-	if (!OidIsValid(funcid) || funcid < FirstNormalObjectId)
+	if (!OidIsValid(funcid) || funcid < MIC_SYSTEM_OID_THRESHOLD)
 		return;					/* built-in / system: exempt */
 
 	objlevel = mic_get_object_level(ProcedureRelationId, funcid);
 
 	if (objlevel < subject_level)
 	{
+		fname = get_func_name(funcid);
+		if (fname == NULL)
+			fname = "(unknown)";
 		if (mic_debug_audit)
 			ereport(LOG,
-					(errmsg("pg_mic: execute denied - subject %s > function %s (func %u) via %s \"%s\"",
+					(errmsg("pg_mic: execute denied - subject %s > function %s \"%s\" (func %u) via %s \"%s\"",
 							mic_level_to_string(subject_level),
-							mic_level_to_string(objlevel), funcid, via, objname)));
+							mic_level_to_string(objlevel), fname, funcid, via, objname)));
 		if (mic_is_enforcing())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("pg_mic: execute denied - %s integrity subject cannot execute %s integrity function reached via %s \"%s\"",
+					 errmsg("pg_mic: execute denied - %s integrity subject cannot execute %s integrity function \"%s\" reached via %s \"%s\"",
 							mic_level_to_string(subject_level),
-							mic_level_to_string(objlevel), via, objname)));
+							mic_level_to_string(objlevel), fname, via, objname)));
 		else
 			ereport(WARNING,
-					(errmsg("pg_mic: execute violation (permissive) via %s \"%s\"",
-							via, objname)));
+					(errmsg("pg_mic: execute violation (permissive) of function \"%s\" via %s \"%s\"",
+							fname, via, objname)));
 	}
 }
 
@@ -156,11 +218,14 @@ check_check_constraints(Relation rel, int subject_level)
 		Node	   *expr;
 
 		if (ccbin == NULL)		/* fail-closed: expected but missing */
-			ereport(ERROR,
+		{
+			ereport(mic_is_enforcing() ? ERROR : WARNING,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("pg_mic: cannot analyze CHECK constraint \"%s\" on \"%s\"",
 							constr->check[i].ccname,
 							RelationGetRelationName(rel))));
+			continue;
+		}
 		expr = stringToNode(ccbin);
 		mic_check_expr_functions(expr, subject_level, "CHECK constraint on",
 								 RelationGetRelationName(rel));
@@ -181,7 +246,7 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 	if (subject_level <= MIC_LEVEL_LOW)
 		return;					/* fast path: nothing is below LOW */
 
-	if (relid < FirstNormalObjectId)
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
 		return;					/* system relation */
 
 	rel = try_table_open(relid, AccessShareLock);

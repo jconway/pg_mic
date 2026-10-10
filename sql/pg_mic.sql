@@ -198,10 +198,18 @@ CREATE FUNCTION public.high_chk(int) RETURNS boolean
     AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;  -- created by superuser => HIGH
 CREATE TABLE r_chk_hi (id int CHECK (public.high_chk(id)));
 INSERT INTO r_chk_hi VALUES (1);
--- LOW subject fast path: a LOW user inserting is never denied by reachability
-GRANT INSERT ON r_chk_ok TO mic_low_user;
+-- HIGH subject UPDATE must also be denied
+UPDATE r_chk SET id = 2;
+-- LOW subject fast path: LOW user, LOW table, CHECK calls LOW function
 SET ROLE mic_low_user;
-INSERT INTO r_chk_ok VALUES (2);
+CREATE TABLE r_chk_low (id int CHECK (public.low_sql_chk(id)));
+INSERT INTO r_chk_low VALUES (1);
+RESET ROLE;
+-- MEDIUM subject must be denied for a LOW function in a CHECK
+GRANT CREATE, USAGE ON SCHEMA public TO mic_medium_user;
+SET ROLE mic_medium_user;
+CREATE TABLE r_chk_med (id int CHECK (public.low_sql_chk(id)));
+INSERT INTO r_chk_med VALUES (1);
 RESET ROLE;
 
 -- ============================================================
@@ -210,12 +218,15 @@ RESET ROLE;
 DROP TABLE r_chk;
 DROP TABLE r_chk_ok;
 DROP TABLE r_chk_hi;
+DROP TABLE r_chk_low;
+DROP TABLE r_chk_med;
 DROP FUNCTION public.low_sql_chk(int);
 DROP FUNCTION public.high_chk(int);
 DROP TABLE mic_test_high;
 DROP TABLE mic_test_medium;
 DROP TABLE mic_test_low;
 REVOKE CREATE, USAGE ON SCHEMA public FROM mic_low_user;
+REVOKE CREATE, USAGE ON SCHEMA public FROM mic_medium_user;
 DROP ROLE mic_high_user;
 DROP ROLE mic_medium_user;
 DROP ROLE mic_low_user;
