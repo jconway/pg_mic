@@ -1,0 +1,5 @@
+# pg_biba extension
+comment = 'Biba mandatory integrity model'
+default_version = '1.0'
+module_pathname = '$libdir/pg_biba'
+relocatable = false

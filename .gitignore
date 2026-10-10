@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+*.so
+*.bc
+# pg_regress output
+/results/
+/regression.diffs
+/regression.out
+/log/
+/tmp_check/
+# SDD scratch workspace (subagent-driven-development ledger/briefs/reports)
+/.superpowers/
+# editor
+*~

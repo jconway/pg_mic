@@ -1,0 +1,311 @@
+-- pg_biba regression tests
+-- Requires: shared_preload_libraries = 'pg_biba'
+CREATE EXTENSION pg_biba;
+-- Check session level (superuser = high)
+SELECT biba_get_session_level();
+ biba_get_session_level 
+------------------------
+ high
+(1 row)
+
+-- Create test roles
+CREATE ROLE biba_high_user LOGIN;
+CREATE ROLE biba_medium_user LOGIN;
+CREATE ROLE biba_low_user LOGIN;
+-- Set role levels
+SELECT biba_set_role_level('biba_high_user', 'high');
+ biba_set_role_level 
+---------------------
+ 
+(1 row)
+
+SELECT biba_set_role_level('biba_medium_user', 'medium');
+ biba_set_role_level 
+---------------------
+ 
+(1 row)
+
+SELECT biba_set_role_level('biba_low_user', 'low');
+ biba_set_role_level 
+---------------------
+ 
+(1 row)
+
+-- Verify role levels
+SELECT biba_get_role_level('biba_high_user');
+ biba_get_role_level 
+---------------------
+ high
+(1 row)
+
+SELECT biba_get_role_level('biba_medium_user');
+ biba_get_role_level 
+---------------------
+ medium
+(1 row)
+
+SELECT biba_get_role_level('biba_low_user');
+ biba_get_role_level 
+---------------------
+ low
+(1 row)
+
+-- Create test tables at various levels
+CREATE TABLE biba_test_high (id int, data text);
+CREATE TABLE biba_test_medium (id int, data text);
+CREATE TABLE biba_test_low (id int, data text);
+-- Label tables
+SELECT biba_promote_table('biba_test_high', 'high');
+ biba_promote_table 
+--------------------
+ 
+(1 row)
+
+SELECT biba_promote_table('biba_test_medium', 'medium');
+ biba_promote_table 
+--------------------
+ 
+(1 row)
+
+SELECT biba_promote_table('biba_test_low', 'low');
+ biba_promote_table 
+--------------------
+ 
+(1 row)
+
+-- Verify table levels
+SELECT biba_get_table_level('biba_test_high');
+ biba_get_table_level 
+----------------------
+ high
+(1 row)
+
+SELECT biba_get_table_level('biba_test_medium');
+ biba_get_table_level 
+----------------------
+ medium
+(1 row)
+
+SELECT biba_get_table_level('biba_test_low');
+ biba_get_table_level 
+----------------------
+ low
+(1 row)
+
+-- Insert test data (as superuser = HIGH)
+INSERT INTO biba_test_high VALUES (1, 'high data');
+INSERT INTO biba_test_medium VALUES (1, 'medium data');
+INSERT INTO biba_test_low VALUES (1, 'low data');
+-- Grant access to test roles
+GRANT ALL ON biba_test_high TO biba_high_user, biba_medium_user, biba_low_user;
+GRANT ALL ON biba_test_medium TO biba_high_user, biba_medium_user, biba_low_user;
+GRANT ALL ON biba_test_low TO biba_high_user, biba_medium_user, biba_low_user;
+-- ============================================================
+-- Test as HIGH user
+-- ============================================================
+SET ROLE biba_high_user;
+SELECT biba_get_session_level();
+ biba_get_session_level 
+------------------------
+ high
+(1 row)
+
+-- HIGH can read HIGH (same level)
+SELECT * FROM biba_test_high;
+ id |   data    
+----+-----------
+  1 | high data
+(1 row)
+
+-- HIGH cannot read MEDIUM (No Read Down)
+SELECT * FROM biba_test_medium;
+ERROR:  pg_biba: read denied - high integrity subject cannot read medium integrity object
+-- HIGH cannot read LOW (No Read Down)
+SELECT * FROM biba_test_low;
+ERROR:  pg_biba: read denied - high integrity subject cannot read low integrity object
+-- HIGH can write HIGH (same level)
+INSERT INTO biba_test_high VALUES (2, 'high insert');
+-- HIGH cannot write MEDIUM (we are higher, but No Write Up doesn't block this;
+-- however we also need read for the table check, which blocks it? No:
+-- INSERT is write-only. HIGH >= MEDIUM so write is OK)
+-- Actually: No Write Up means subject >= object. HIGH(3) >= MEDIUM(2) so write OK.
+INSERT INTO biba_test_medium VALUES (2, 'high writes medium');
+-- HIGH can write LOW
+INSERT INTO biba_test_low VALUES (2, 'high writes low');
+RESET ROLE;
+-- ============================================================
+-- Test as LOW user
+-- ============================================================
+SET ROLE biba_low_user;
+SELECT biba_get_session_level();
+ biba_get_session_level 
+------------------------
+ low
+(1 row)
+
+-- LOW can read LOW (same level)
+SELECT * FROM biba_test_low;
+ id |      data       
+----+-----------------
+  1 | low data
+  2 | high writes low
+(2 rows)
+
+-- LOW can read MEDIUM (No Read Down: subject(1) <= object(2), OK)
+SELECT * FROM biba_test_medium;
+ id |        data        
+----+--------------------
+  1 | medium data
+  2 | high writes medium
+(2 rows)
+
+-- LOW can read HIGH (No Read Down: subject(1) <= object(3), OK)
+SELECT * FROM biba_test_high;
+ id |    data     
+----+-------------
+  1 | high data
+  2 | high insert
+(2 rows)
+
+-- LOW can write LOW (same level)
+INSERT INTO biba_test_low VALUES (3, 'low insert');
+-- LOW cannot write MEDIUM (No Write Up: subject(1) < object(2))
+INSERT INTO biba_test_medium VALUES (3, 'low writes medium');
+ERROR:  pg_biba: write denied - low integrity subject cannot write medium integrity object
+-- LOW cannot write HIGH (No Write Up: subject(1) < object(3))
+INSERT INTO biba_test_high VALUES (3, 'low writes high');
+ERROR:  pg_biba: write denied - low integrity subject cannot write high integrity object
+-- LOW cannot UPDATE HIGH (requires both read and write, fails write)
+UPDATE biba_test_high SET data = 'tampered' WHERE id = 1;
+ERROR:  pg_biba: write denied - low integrity subject cannot write high integrity object
+-- LOW cannot DELETE HIGH
+DELETE FROM biba_test_high WHERE id = 1;
+ERROR:  pg_biba: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+-- ============================================================
+-- Test as MEDIUM user
+-- ============================================================
+SET ROLE biba_medium_user;
+SELECT biba_get_session_level();
+ biba_get_session_level 
+------------------------
+ medium
+(1 row)
+
+-- MEDIUM can read MEDIUM
+SELECT * FROM biba_test_medium;
+ id |        data        
+----+--------------------
+  1 | medium data
+  2 | high writes medium
+(2 rows)
+
+-- MEDIUM can read HIGH (subject(2) <= object(3))
+SELECT * FROM biba_test_high;
+ id |    data     
+----+-------------
+  1 | high data
+  2 | high insert
+(2 rows)
+
+-- MEDIUM cannot read LOW (subject(2) > object(1))
+SELECT * FROM biba_test_low;
+ERROR:  pg_biba: read denied - medium integrity subject cannot read low integrity object
+-- MEDIUM can write MEDIUM
+INSERT INTO biba_test_medium VALUES (4, 'medium insert');
+-- MEDIUM can write LOW (subject(2) >= object(1))
+INSERT INTO biba_test_low VALUES (4, 'medium writes low');
+-- MEDIUM cannot write HIGH (subject(2) < object(3))
+INSERT INTO biba_test_high VALUES (4, 'medium writes high');
+ERROR:  pg_biba: write denied - medium integrity subject cannot write high integrity object
+RESET ROLE;
+-- ============================================================
+-- Test SECURITY LABEL syntax
+-- ============================================================
+SECURITY LABEL FOR biba ON TABLE biba_test_low IS 'medium';
+SELECT biba_get_table_level('biba_test_low');
+ biba_get_table_level 
+----------------------
+ medium
+(1 row)
+
+-- Invalid label should fail
+SECURITY LABEL FOR biba ON TABLE biba_test_low IS 'invalid';
+ERROR:  pg_biba: "invalid" is not a valid integrity level
+HINT:  Valid levels are: low, medium, high.
+-- Restore
+SECURITY LABEL FOR biba ON TABLE biba_test_low IS 'low';
+-- ============================================================
+-- Test permissive mode
+-- ============================================================
+-- Switch to permissive mode (need to reload for PGC_SIGHUP, so just
+-- test that the GUC exists)
+SHOW biba.mode;
+ biba.mode 
+-----------
+ enforcing
+(1 row)
+
+SHOW biba.debug_audit;
+ biba.debug_audit 
+------------------
+ off
+(1 row)
+
+-- ============================================================
+-- Test biba_promote_object (generic)
+-- ============================================================
+SELECT biba_promote_object('pg_catalog.pg_class'::regclass::oid,
+                           'biba_test_low'::regclass::oid,
+                           'high');
+ biba_promote_object 
+---------------------
+ 
+(1 row)
+
+SELECT biba_get_table_level('biba_test_low');
+ biba_get_table_level 
+----------------------
+ high
+(1 row)
+
+-- Restore
+SELECT biba_promote_table('biba_test_low', 'low');
+ biba_promote_table 
+--------------------
+ 
+(1 row)
+
+-- ============================================================
+-- Test views
+-- ============================================================
+SELECT count(*) >= 0 AS has_labels FROM biba_labels;
+ has_labels 
+------------
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS has_role_labels FROM biba_role_labels;
+ has_role_labels 
+-----------------
+ t
+(1 row)
+
+-- ============================================================
+-- Non-superuser cannot set labels
+-- ============================================================
+SET ROLE biba_low_user;
+SELECT biba_set_role_level('biba_low_user', 'high');
+ERROR:  pg_biba: only superuser can set role integrity levels
+SELECT biba_promote_table('biba_test_low', 'high');
+ERROR:  pg_biba: only superuser can promote table integrity levels
+RESET ROLE;
+-- ============================================================
+-- Cleanup
+-- ============================================================
+DROP TABLE biba_test_high;
+DROP TABLE biba_test_medium;
+DROP TABLE biba_test_low;
+DROP ROLE biba_high_user;
+DROP ROLE biba_medium_user;
+DROP ROLE biba_low_user;
