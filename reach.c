@@ -18,6 +18,8 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/htup_details.h"
+#include "access/tupdesc.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
@@ -262,6 +264,60 @@ check_triggers(Relation rel, int subject_level, AclMode required_ops)
 	}
 }
 
+/*
+ * Column defaults and generated columns.  Plain defaults and STORED generated
+ * columns are evaluated on write; VIRTUAL generated columns (PG18+) are
+ * evaluated on read (and checked conservatively on write too).
+ */
+static void
+check_defaults_and_generated(Relation rel, int subject_level, AclMode required_ops)
+{
+	TupleDesc	td = RelationGetDescr(rel);
+	TupleConstr *constr = td->constr;
+	bool		is_write = (required_ops & (ACL_INSERT | ACL_UPDATE)) != 0;
+#if PG_VERSION_NUM >= 180000
+	bool		is_read = (required_ops & ACL_SELECT) != 0;
+#endif
+	int			i;
+
+	if (constr == NULL || constr->num_defval == 0)
+		return;
+
+	for (i = 0; i < constr->num_defval; i++)
+	{
+		AttrDefault *d = &constr->defval[i];
+		Form_pg_attribute att = TupleDescAttr(td, d->adnum - 1);
+		char		gen = att->attgenerated;
+		bool		want;
+		Node	   *expr;
+
+		if (gen == ATTRIBUTE_GENERATED_STORED)
+			want = is_write;
+#if PG_VERSION_NUM >= 180000
+		else if (gen == ATTRIBUTE_GENERATED_VIRTUAL)
+			want = is_read || is_write;
+#endif
+		else
+			want = is_write;		/* plain column DEFAULT */
+
+		if (!want)
+			continue;
+		if (d->adbin == NULL)		/* fail-closed: expected but missing */
+		{
+			ereport(mic_is_enforcing() ? ERROR : WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("pg_mic: cannot analyze default expression of column \"%s\" on \"%s\"",
+							NameStr(att->attname),
+							RelationGetRelationName(rel))));
+			continue;
+		}
+		expr = stringToNode(d->adbin);
+		mic_check_expr_functions(expr, subject_level,
+								 (gen ? "generated column on" : "column default on"),
+								 RelationGetRelationName(rel));
+	}
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {
@@ -286,7 +342,8 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 	if (need_write)
 		check_check_constraints(rel, subject_level);
 	check_triggers(rel, subject_level, required_ops);
-	/* subsequent tasks add: defaults, generated, index, excl, RLS, domain */
+	check_defaults_and_generated(rel, subject_level, required_ops);
+	/* subsequent tasks add: index, excl, RLS, domain */
 
 	table_close(rel, AccessShareLock);
 }

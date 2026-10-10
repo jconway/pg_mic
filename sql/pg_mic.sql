@@ -244,8 +244,36 @@ CREATE TRIGGER t_ins_only BEFORE INSERT ON r_trg_insonly
 DELETE FROM r_trg_insonly WHERE id = 0;
 
 -- ============================================================
+-- Reachable-function enforcement: defaults and generated columns
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_def() RETURNS int AS 'BEGIN RETURN 7; END' LANGUAGE plpgsql VOLATILE;
+CREATE FUNCTION public.low_gen(int) RETURNS int AS 'SELECT $1 * 2' LANGUAGE sql IMMUTABLE;
+RESET ROLE;
+-- DEFAULT reaches a LOW function on INSERT
+CREATE TABLE r_def (id int DEFAULT public.low_def());
+INSERT INTO r_def DEFAULT VALUES;
+-- STORED generated column reaches a LOW function on write
+CREATE TABLE r_gs (id int, g int GENERATED ALWAYS AS (public.low_gen(id)) STORED);
+INSERT INTO r_gs (id) VALUES (1);
+-- VIRTUAL generated columns exist only on PG18+; silent no-op elsewhere
+SELECT current_setting('server_version_num')::int >= 180000 AS pg18plus \gset
+\if :pg18plus
+-- (PG18 rejects user-defined functions in VIRTUAL expressions, so only a
+-- built-in expression is possible; it must remain usable by a HIGH subject)
+CREATE TABLE r_gv (id int, g int GENERATED ALWAYS AS (id * 2) VIRTUAL);
+INSERT INTO r_gv (id) VALUES (1);
+SELECT g FROM r_gv;
+DROP TABLE r_gv;
+\endif
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_def;
+DROP TABLE r_gs;
+DROP FUNCTION public.low_def();
+DROP FUNCTION public.low_gen(int);
 DROP TABLE r_trg;
 DROP TABLE r_trg_insonly;
 DROP FUNCTION public.low_trig_ins_only();
