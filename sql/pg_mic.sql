@@ -312,9 +312,35 @@ INSERT INTO r_rls VALUES (1);
 ALTER TABLE r_rls FORCE ROW LEVEL SECURITY;
 SELECT count(*) FROM r_rls;            -- denied: USING qual reaches LOW fn
 
+-- primary rd_rsdesc path: non-superuser HIGH subject genuinely subject to RLS
+CREATE ROLE mic_rls_high LOGIN;
+SELECT mic_set_role_level('mic_rls_high', 'high');
+CREATE TABLE r_rls_pri (id int);
+INSERT INTO r_rls_pri VALUES (1);
+ALTER TABLE r_rls_pri ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_pri ON r_rls_pri FOR ALL TO mic_rls_high
+    USING (public.low_rls(id)) WITH CHECK (public.low_rls(id));
+GRANT SELECT, INSERT ON r_rls_pri TO mic_rls_high;
+SET ROLE mic_rls_high;
+SELECT count(*) FROM r_rls_pri;        -- denied: USING policy reaches LOW fn
+INSERT INTO r_rls_pri VALUES (2);      -- denied: WITH CHECK policy reaches LOW fn
+RESET ROLE;
+CREATE TABLE r_rls_ok (id int);
+ALTER TABLE r_rls_ok ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_ok ON r_rls_ok FOR ALL TO mic_rls_high
+    USING (id >= 0) WITH CHECK (id >= 0);
+GRANT SELECT, INSERT ON r_rls_ok TO mic_rls_high;
+SET ROLE mic_rls_high;
+SELECT count(*) FROM r_rls_ok;         -- allowed: built-in policy
+INSERT INTO r_rls_ok VALUES (1);       -- allowed
+RESET ROLE;
+
 -- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_rls_ok;
+DROP TABLE r_rls_pri;
+DROP ROLE mic_rls_high;
 DROP TABLE r_rls;
 DROP FUNCTION public.low_rls(int);
 DROP TABLE r_dom;
