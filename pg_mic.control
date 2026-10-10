@@ -1,0 +1,5 @@
+# pg_mic extension
+comment = 'Mandatory integrity control (a Biba-style integrity model)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_mic'
+relocatable = false

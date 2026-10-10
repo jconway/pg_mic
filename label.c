@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *
- * contrib/pg_biba/label.c
+ * contrib/pg_mic/label.c
  *
  * Label provider: level conversion, subject/object level resolution,
  * and relabel validation for the Biba integrity model.
@@ -15,42 +15,42 @@
 #include "catalog/pg_class.h"
 #include "commands/seclabel.h"
 #include "miscadmin.h"
-#include "pg_biba.h"
+#include "pg_mic.h"
 #include "utils/builtins.h"
 
 /*
  * Convert a string label to an integrity level value.
- * Returns BIBA_LEVEL_INVALID if the label is not recognized.
+ * Returns MIC_LEVEL_INVALID if the label is not recognized.
  */
 int
-biba_level_from_string(const char *label)
+mic_level_from_string(const char *label)
 {
 	if (label == NULL)
-		return BIBA_LEVEL_INVALID;
+		return MIC_LEVEL_INVALID;
 
 	if (pg_strcasecmp(label, "low") == 0)
-		return BIBA_LEVEL_LOW;
+		return MIC_LEVEL_LOW;
 	if (pg_strcasecmp(label, "medium") == 0)
-		return BIBA_LEVEL_MEDIUM;
+		return MIC_LEVEL_MEDIUM;
 	if (pg_strcasecmp(label, "high") == 0)
-		return BIBA_LEVEL_HIGH;
+		return MIC_LEVEL_HIGH;
 
-	return BIBA_LEVEL_INVALID;
+	return MIC_LEVEL_INVALID;
 }
 
 /*
  * Convert an integrity level value to its canonical string label.
  */
 const char *
-biba_level_to_string(int level)
+mic_level_to_string(int level)
 {
 	switch (level)
 	{
-		case BIBA_LEVEL_LOW:
+		case MIC_LEVEL_LOW:
 			return "low";
-		case BIBA_LEVEL_MEDIUM:
+		case MIC_LEVEL_MEDIUM:
 			return "medium";
-		case BIBA_LEVEL_HIGH:
+		case MIC_LEVEL_HIGH:
 			return "high";
 		default:
 			return "unknown";
@@ -65,27 +65,27 @@ biba_level_to_string(int level)
  * - Unlabeled role => LOW
  */
 int
-biba_get_subject_level(void)
+mic_get_subject_level(void)
 {
 	ObjectAddress object;
 	char	   *label;
 	int			level;
 
 	if (superuser())
-		return BIBA_LEVEL_HIGH;
+		return MIC_LEVEL_HIGH;
 
 	object.classId = AuthIdRelationId;
 	object.objectId = GetUserId();
 	object.objectSubId = 0;
 
-	label = GetSecurityLabel(&object, BIBA_LABEL_TAG);
+	label = GetSecurityLabel(&object, MIC_LABEL_TAG);
 	if (label == NULL)
-		return BIBA_LEVEL_LOW;
+		return MIC_LEVEL_LOW;
 
-	level = biba_level_from_string(label);
+	level = mic_level_from_string(label);
 	pfree(label);
 
-	return (level != BIBA_LEVEL_INVALID) ? level : BIBA_LEVEL_LOW;
+	return (level != MIC_LEVEL_INVALID) ? level : MIC_LEVEL_LOW;
 }
 
 /*
@@ -96,38 +96,38 @@ biba_get_subject_level(void)
  * - Unlabeled object => LOW
  */
 int
-biba_get_object_level(Oid classId, Oid objectId)
+mic_get_object_level(Oid classId, Oid objectId)
 {
 	ObjectAddress object;
 	char	   *label;
 	int			level;
 
 	/* System objects are implicitly HIGH integrity */
-	if (objectId < BIBA_SYSTEM_OID_THRESHOLD)
-		return BIBA_LEVEL_HIGH;
+	if (objectId < MIC_SYSTEM_OID_THRESHOLD)
+		return MIC_LEVEL_HIGH;
 
 	object.classId = classId;
 	object.objectId = objectId;
 	object.objectSubId = 0;
 
-	label = GetSecurityLabel(&object, BIBA_LABEL_TAG);
+	label = GetSecurityLabel(&object, MIC_LABEL_TAG);
 	if (label == NULL)
-		return BIBA_LEVEL_LOW;
+		return MIC_LEVEL_LOW;
 
-	level = biba_level_from_string(label);
+	level = mic_level_from_string(label);
 	pfree(label);
 
-	return (level != BIBA_LEVEL_INVALID) ? level : BIBA_LEVEL_LOW;
+	return (level != MIC_LEVEL_INVALID) ? level : MIC_LEVEL_LOW;
 }
 
 /*
- * biba_object_relabel
+ * mic_object_relabel
  *
- * Validation hook for SECURITY LABEL FOR biba ON ... IS '...';
+ * Validation hook for SECURITY LABEL FOR mic ON ... IS '...';
  * Called by the security label infrastructure before applying the label.
  */
 void
-biba_object_relabel(const ObjectAddress *object, const char *seclabel)
+mic_object_relabel(const ObjectAddress *object, const char *seclabel)
 {
 	/* NULL means "remove the label" -- always allowed for superuser */
 	if (seclabel == NULL)
@@ -135,20 +135,20 @@ biba_object_relabel(const ObjectAddress *object, const char *seclabel)
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("pg_biba: only superuser can remove integrity labels")));
+					 errmsg("pg_mic: only superuser can remove integrity labels")));
 		return;
 	}
 
 	/* Validate the label string */
-	if (biba_level_from_string(seclabel) == BIBA_LEVEL_INVALID)
+	if (mic_level_from_string(seclabel) == MIC_LEVEL_INVALID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("pg_biba: \"%s\" is not a valid integrity level", seclabel),
+				 errmsg("pg_mic: \"%s\" is not a valid integrity level", seclabel),
 				 errhint("Valid levels are: low, medium, high.")));
 
 	/* Only superuser can set integrity labels */
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("pg_biba: only superuser can set integrity labels")));
+				 errmsg("pg_mic: only superuser can set integrity labels")));
 }

@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *
- * contrib/pg_biba/dml.c
+ * contrib/pg_mic/dml.c
  *
  * DML permission checks for the Biba integrity model.
  *
@@ -19,17 +19,17 @@
 #include "catalog/pg_class.h"
 #include "executor/executor.h"
 #include "nodes/nodes.h"
-#include "pg_biba.h"
+#include "pg_mic.h"
 #include "utils/lsyscache.h"
 
 /*
- * biba_dml_privileges
+ * mic_dml_privileges
  *
  * Entrypoint for DML permission checks.  Iterates over RTEPermissionInfo
  * entries and applies Biba checks based on the required permissions.
  */
 bool
-biba_dml_privileges(List *rangeTbls, List *rteperminfos,
+mic_dml_privileges(List *rangeTbls, List *rteperminfos,
 					bool abort_on_violation)
 {
 	ListCell   *lr;
@@ -49,7 +49,7 @@ biba_dml_privileges(List *rangeTbls, List *rteperminfos,
 			continue;
 
 		/* Skip system-OID objects */
-		if (relOid < BIBA_SYSTEM_OID_THRESHOLD)
+		if (relOid < MIC_SYSTEM_OID_THRESHOLD)
 			continue;
 
 		/* Determine required access types */
@@ -80,11 +80,11 @@ biba_dml_privileges(List *rangeTbls, List *rteperminfos,
 			PG_TRY();
 			{
 				if (need_read && need_write)
-					biba_check_readwrite(RelationRelationId, relOid);
+					mic_check_readwrite(RelationRelationId, relOid);
 				else if (need_read)
-					biba_check_read(RelationRelationId, relOid);
+					mic_check_read(RelationRelationId, relOid);
 				else
-					biba_check_write(RelationRelationId, relOid);
+					mic_check_write(RelationRelationId, relOid);
 			}
 			PG_CATCH();
 			{
@@ -96,11 +96,11 @@ biba_dml_privileges(List *rangeTbls, List *rteperminfos,
 		else
 		{
 			if (need_read && need_write)
-				biba_check_readwrite(RelationRelationId, relOid);
+				mic_check_readwrite(RelationRelationId, relOid);
 			else if (need_read)
-				biba_check_read(RelationRelationId, relOid);
+				mic_check_read(RelationRelationId, relOid);
 			else
-				biba_check_write(RelationRelationId, relOid);
+				mic_check_write(RelationRelationId, relOid);
 		}
 	}
 

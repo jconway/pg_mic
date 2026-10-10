@@ -1,6 +1,6 @@
-# pg_biba -- Biba Mandatory Integrity Model for PostgreSQL
+# pg_mic -- Biba Mandatory Integrity Model for PostgreSQL
 
-`pg_biba` is a PostgreSQL extension that enforces the Biba mandatory integrity
+`pg_mic` is a PostgreSQL extension that enforces the Biba mandatory integrity
 model. The Biba model is the dual of Bell-LaPadula: it protects data
 **integrity** rather than confidentiality. It prevents high-integrity subjects
 from being contaminated by low-integrity data, and prevents low-integrity
@@ -59,7 +59,7 @@ Operation mapping:
 
 ### Requirements
 
-`pg_biba` must be loaded via `shared_preload_libraries` because it installs
+`pg_mic` must be loaded via `shared_preload_libraries` because it installs
 hooks at server startup.
 
 ### Build and Install
@@ -67,14 +67,14 @@ hooks at server startup.
 From a PostgreSQL source tree:
 
 ```sh
-make -C contrib/pg_biba
-make -C contrib/pg_biba install
+make -C contrib/pg_mic
+make -C contrib/pg_mic install
 ```
 
 Or with PGXS against an installed PostgreSQL:
 
 ```sh
-cd contrib/pg_biba
+cd contrib/pg_mic
 USE_PGXS=1 make
 USE_PGXS=1 make install
 ```
@@ -84,13 +84,13 @@ USE_PGXS=1 make install
 Add to `postgresql.conf`:
 
 ```
-shared_preload_libraries = 'pg_biba'
+shared_preload_libraries = 'pg_mic'
 ```
 
 Restart PostgreSQL, then create the extension in each database:
 
 ```sql
-CREATE EXTENSION pg_biba;
+CREATE EXTENSION pg_mic;
 ```
 
 ## Configuration
@@ -99,8 +99,8 @@ CREATE EXTENSION pg_biba;
 
 | GUC                | Type | Default     | Context    | Description                          |
 |--------------------|------|-------------|------------|--------------------------------------|
-| `biba.mode`        | enum | `enforcing` | PGC_SIGHUP | `enforcing`, `permissive`, `disabled`|
-| `biba.debug_audit` | bool | `off`       | PGC_USERSET| Log all access control decisions     |
+| `mic.mode`        | enum | `enforcing` | PGC_SIGHUP | `enforcing`, `permissive`, `disabled`|
+| `mic.debug_audit` | bool | `off`       | PGC_USERSET| Log all access control decisions     |
 
 - **enforcing** -- violations are denied with an error.
 - **permissive** -- violations are logged as warnings but allowed.
@@ -109,7 +109,7 @@ CREATE EXTENSION pg_biba;
 Change mode at runtime (takes effect after `pg_ctl reload`):
 
 ```sql
-ALTER SYSTEM SET biba.mode = 'permissive';
+ALTER SYSTEM SET mic.mode = 'permissive';
 SELECT pg_reload_conf();
 ```
 
@@ -120,14 +120,14 @@ SELECT pg_reload_conf();
 Only superusers can assign integrity levels to roles:
 
 ```sql
-SELECT biba_set_role_level('analyst', 'medium');
-SELECT biba_set_role_level('auditor', 'high');
+SELECT mic_set_role_level('analyst', 'medium');
+SELECT mic_set_role_level('auditor', 'high');
 ```
 
 Or using the native security label syntax:
 
 ```sql
-SECURITY LABEL FOR biba ON ROLE analyst IS 'medium';
+SECURITY LABEL FOR mic ON ROLE analyst IS 'medium';
 ```
 
 ### Labeling Tables and Functions
@@ -138,13 +138,13 @@ superuser during `CREATE EXTENSION`, they are labeled HIGH and remain
 callable by high-integrity users. A superuser can change a table's level:
 
 ```sql
-SELECT biba_promote_table('sensitive_data', 'high');
+SELECT mic_promote_table('sensitive_data', 'high');
 ```
 
 Or using the native syntax:
 
 ```sql
-SECURITY LABEL FOR biba ON TABLE sensitive_data IS 'high';
+SECURITY LABEL FOR mic ON TABLE sensitive_data IS 'high';
 ```
 
 ### Initializing Labels
@@ -152,32 +152,32 @@ SECURITY LABEL FOR biba ON TABLE sensitive_data IS 'high';
 To label all existing unlabeled user tables at the caller's level:
 
 ```sql
-SELECT biba_initialize_labels();
+SELECT mic_initialize_labels();
 ```
 
 ### Querying Labels
 
 ```sql
 -- Current session's integrity level
-SELECT biba_get_session_level();
+SELECT mic_get_session_level();
 
 -- A role's level
-SELECT biba_get_role_level('analyst');
+SELECT mic_get_role_level('analyst');
 
 -- A table's level
-SELECT biba_get_table_level('sensitive_data');
+SELECT mic_get_table_level('sensitive_data');
 ```
 
 ### Views
 
 | View               | Description                              |
 |--------------------|------------------------------------------|
-| `biba_labels`      | All labeled objects with their levels     |
-| `biba_role_labels` | All roles with assigned integrity levels  |
+| `mic_labels`      | All labeled objects with their levels     |
+| `mic_role_labels` | All roles with assigned integrity levels  |
 
 ```sql
-SELECT * FROM biba_role_labels;
-SELECT * FROM biba_labels;
+SELECT * FROM mic_role_labels;
+SELECT * FROM mic_labels;
 ```
 
 ### Generic Object Promotion
@@ -185,7 +185,7 @@ SELECT * FROM biba_labels;
 For objects other than tables:
 
 ```sql
-SELECT biba_promote_object(class_id, object_id, 'high');
+SELECT mic_promote_object(class_id, object_id, 'high');
 ```
 
 ## Example
@@ -194,11 +194,11 @@ SELECT biba_promote_object(class_id, object_id, 'high');
 -- Setup
 CREATE ROLE trusted_writer LOGIN;
 CREATE ROLE untrusted_reader LOGIN;
-SELECT biba_set_role_level('trusted_writer', 'high');
+SELECT mic_set_role_level('trusted_writer', 'high');
 -- untrusted_reader is unlabeled, so defaults to LOW
 
 CREATE TABLE verified_facts (id serial, fact text);
-SELECT biba_promote_table('verified_facts', 'high');
+SELECT mic_promote_table('verified_facts', 'high');
 GRANT ALL ON verified_facts TO trusted_writer, untrusted_reader;
 GRANT USAGE ON SEQUENCE verified_facts_id_seq TO trusted_writer, untrusted_reader;
 
@@ -219,17 +219,17 @@ RESET ROLE;
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `biba_get_session_level()` | text | Current user's integrity level |
-| `biba_get_role_level(role_name text)` | text | Named role's integrity level |
-| `biba_get_table_level(table_name text)` | text | Named table's integrity level |
-| `biba_set_role_level(role_name text, level text)` | void | Set a role's level (superuser only) |
-| `biba_promote_table(table_name text, new_level text)` | void | Set a table's level (superuser only) |
-| `biba_promote_object(class_id oid, object_id oid, new_level text)` | void | Set any object's level (superuser only) |
-| `biba_initialize_labels()` | void | Label all unlabeled user tables (superuser only) |
+| `mic_get_session_level()` | text | Current user's integrity level |
+| `mic_get_role_level(role_name text)` | text | Named role's integrity level |
+| `mic_get_table_level(table_name text)` | text | Named table's integrity level |
+| `mic_set_role_level(role_name text, level text)` | void | Set a role's level (superuser only) |
+| `mic_promote_table(table_name text, new_level text)` | void | Set a table's level (superuser only) |
+| `mic_promote_object(class_id oid, object_id oid, new_level text)` | void | Set any object's level (superuser only) |
+| `mic_initialize_labels()` | void | Label all unlabeled user tables (superuser only) |
 
 ## Running Tests
 
 ```sh
-# Requires a running server with shared_preload_libraries = 'pg_biba'
-make -C contrib/pg_biba installcheck
+# Requires a running server with shared_preload_libraries = 'pg_mic'
+make -C contrib/pg_mic installcheck
 ```

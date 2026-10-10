@@ -1,50 +1,50 @@
-/* contrib/pg_biba/pg_biba--1.0.sql */
+/* contrib/pg_mic/pg_mic--1.0.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION pg_biba" to load this file. \quit
+\echo Use "CREATE EXTENSION pg_mic" to load this file. \quit
 
 -- Introspection functions
 
-CREATE FUNCTION biba_get_session_level()
+CREATE FUNCTION mic_get_session_level()
 RETURNS text
-AS 'MODULE_PATHNAME', 'biba_get_session_level'
+AS 'MODULE_PATHNAME', 'mic_get_session_level'
 LANGUAGE C STRICT STABLE;
 
-CREATE FUNCTION biba_get_role_level(role_name text)
+CREATE FUNCTION mic_get_role_level(role_name text)
 RETURNS text
-AS 'MODULE_PATHNAME', 'biba_get_role_level'
+AS 'MODULE_PATHNAME', 'mic_get_role_level'
 LANGUAGE C STRICT STABLE;
 
-CREATE FUNCTION biba_get_table_level(table_name text)
+CREATE FUNCTION mic_get_table_level(table_name text)
 RETURNS text
-AS 'MODULE_PATHNAME', 'biba_get_table_level'
+AS 'MODULE_PATHNAME', 'mic_get_table_level'
 LANGUAGE C STRICT STABLE;
 
 -- Administration functions (superuser only)
 
-CREATE FUNCTION biba_set_role_level(role_name text, level text)
+CREATE FUNCTION mic_set_role_level(role_name text, level text)
 RETURNS void
-AS 'MODULE_PATHNAME', 'biba_set_role_level'
+AS 'MODULE_PATHNAME', 'mic_set_role_level'
 LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION biba_promote_table(table_name text, new_level text)
+CREATE FUNCTION mic_promote_table(table_name text, new_level text)
 RETURNS void
-AS 'MODULE_PATHNAME', 'biba_promote_table'
+AS 'MODULE_PATHNAME', 'mic_promote_table'
 LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION biba_promote_object(class_id oid, object_id oid, new_level text)
+CREATE FUNCTION mic_promote_object(class_id oid, object_id oid, new_level text)
 RETURNS void
-AS 'MODULE_PATHNAME', 'biba_promote_object'
+AS 'MODULE_PATHNAME', 'mic_promote_object'
 LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION biba_initialize_labels()
+CREATE FUNCTION mic_initialize_labels()
 RETURNS void
-AS 'MODULE_PATHNAME', 'biba_initialize_labels'
+AS 'MODULE_PATHNAME', 'mic_initialize_labels'
 LANGUAGE C STRICT VOLATILE;
 
 -- Views
 
-CREATE VIEW biba_labels AS
+CREATE VIEW mic_labels AS
 SELECT
     s.objoid,
     s.classoid,
@@ -63,14 +63,14 @@ SELECT
         ELSE s.objoid::text
     END AS object_name
 FROM pg_seclabel s
-WHERE s.provider = 'biba';
+WHERE s.provider = 'mic';
 
-CREATE VIEW biba_role_labels AS
+CREATE VIEW mic_role_labels AS
 SELECT
     s.objoid AS role_oid,
     r.rolname AS role_name,
     s.label AS integrity_level
 FROM pg_shseclabel s
 JOIN pg_authid r ON r.oid = s.objoid
-WHERE s.provider = 'biba'
+WHERE s.provider = 'mic'
   AND s.classoid = 'pg_catalog.pg_authid'::regclass;

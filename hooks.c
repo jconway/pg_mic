@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *
- * contrib/pg_biba/hooks.c
+ * contrib/pg_mic/hooks.c
  *
  * Module initialization and hook dispatch for the Biba integrity model.
  *
@@ -19,13 +19,13 @@
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
-#include "pg_biba.h"
+#include "pg_mic.h"
 #include "tcop/utility.h"
 #include "utils/guc.h"
 #include "utils/queryenvironment.h"
 
 PG_MODULE_MAGIC_EXT(
-					.name = "pg_biba",
+					.name = "pg_mic",
 					.version = PG_VERSION
 );
 
@@ -39,29 +39,29 @@ static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 /*
  * GUC variables
  */
-int			biba_mode = BIBA_MODE_ENFORCING;
-bool		biba_debug_audit = false;
+int			mic_mode = MIC_MODE_ENFORCING;
+bool		mic_debug_audit = false;
 
-static const struct config_enum_entry biba_mode_options[] = {
-	{"disabled", BIBA_MODE_DISABLED, false},
-	{"permissive", BIBA_MODE_PERMISSIVE, false},
-	{"enforcing", BIBA_MODE_ENFORCING, false},
+static const struct config_enum_entry mic_mode_options[] = {
+	{"disabled", MIC_MODE_DISABLED, false},
+	{"permissive", MIC_MODE_PERMISSIVE, false},
+	{"enforcing", MIC_MODE_ENFORCING, false},
 	{NULL, 0, false}
 };
 
 bool
-biba_is_enforcing(void)
+mic_is_enforcing(void)
 {
-	return biba_mode == BIBA_MODE_ENFORCING;
+	return mic_mode == MIC_MODE_ENFORCING;
 }
 
 /*
- * biba_object_access
+ * mic_object_access
  *
  * object_access_hook callback: dispatches based on access type.
  */
 static void
-biba_object_access(ObjectAccessType access,
+mic_object_access(ObjectAccessType access,
 				   Oid classId,
 				   Oid objectId,
 				   int subId,
@@ -71,7 +71,7 @@ biba_object_access(ObjectAccessType access,
 		(*next_object_access_hook) (access, classId, objectId, subId, arg);
 
 	/* Skip if disabled */
-	if (biba_mode == BIBA_MODE_DISABLED)
+	if (mic_mode == MIC_MODE_DISABLED)
 		return;
 
 	switch (access)
@@ -101,8 +101,8 @@ biba_object_access(ObjectAccessType access,
 					object.objectId = objectId;
 					object.objectSubId = 0;
 
-					level_str = biba_level_to_string(biba_get_subject_level());
-					SetSecurityLabel(&object, BIBA_LABEL_TAG, level_str);
+					level_str = mic_level_to_string(mic_get_subject_level());
+					SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
 				}
 			}
 			break;
@@ -115,7 +115,7 @@ biba_object_access(ObjectAccessType access,
 					break;
 
 				if (classId == RelationRelationId && subId == 0)
-					biba_check_write(classId, objectId);
+					mic_check_write(classId, objectId);
 			}
 			break;
 
@@ -127,14 +127,14 @@ biba_object_access(ObjectAccessType access,
 					break;
 
 				if (classId == RelationRelationId && subId == 0)
-					biba_check_write(classId, objectId);
+					mic_check_write(classId, objectId);
 			}
 			break;
 
 		case OAT_TRUNCATE:
 			{
 				if (classId == RelationRelationId)
-					biba_check_write(classId, objectId);
+					mic_check_write(classId, objectId);
 			}
 			break;
 
@@ -170,51 +170,51 @@ biba_object_access(ObjectAccessType access,
 				 * planted by a low-integrity user).
 				 *
 				 * Built-in functions (OID below the system threshold) are
-				 * exempt inside biba_check_read, so ordinary SQL keeps
+				 * exempt inside mic_check_read, so ordinary SQL keeps
 				 * working.  User-defined functions carry the integrity
 				 * level of their creator, assigned at OAT_POST_CREATE; the
 				 * extension's own functions are created by a superuser
 				 * during CREATE EXTENSION and are therefore HIGH.
 				 */
-				biba_check_read(classId, objectId);
+				mic_check_read(classId, objectId);
 			}
 			break;
 
 		default:
-			elog(ERROR, "pg_biba: unexpected object access type: %d",
+			elog(ERROR, "pg_mic: unexpected object access type: %d",
 				 (int) access);
 			break;
 	}
 }
 
 /*
- * biba_exec_check_perms
+ * mic_exec_check_perms
  *
  * ExecutorCheckPerms_hook callback: DML permission checks.
  */
 static bool
-biba_exec_check_perms(List *rangeTbls, List *rteperminfos, bool abort)
+mic_exec_check_perms(List *rangeTbls, List *rteperminfos, bool abort)
 {
 	if (next_exec_check_perms_hook &&
 		!(*next_exec_check_perms_hook) (rangeTbls, rteperminfos, abort))
 		return false;
 
-	if (biba_mode == BIBA_MODE_DISABLED)
+	if (mic_mode == MIC_MODE_DISABLED)
 		return true;
 
-	if (!biba_dml_privileges(rangeTbls, rteperminfos, abort))
+	if (!mic_dml_privileges(rangeTbls, rteperminfos, abort))
 		return false;
 
 	return true;
 }
 
 /*
- * biba_utility_command
+ * mic_utility_command
  *
  * ProcessUtility_hook callback: block LOAD in enforcing mode.
  */
 static void
-biba_utility_command(PlannedStmt *pstmt,
+mic_utility_command(PlannedStmt *pstmt,
 					 const char *queryString,
 					 bool readOnlyTree,
 					 ProcessUtilityContext context,
@@ -225,13 +225,13 @@ biba_utility_command(PlannedStmt *pstmt,
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 
-	if (biba_mode != BIBA_MODE_DISABLED)
+	if (mic_mode != MIC_MODE_DISABLED)
 	{
-		if (nodeTag(parsetree) == T_LoadStmt && biba_is_enforcing())
+		if (nodeTag(parsetree) == T_LoadStmt && mic_is_enforcing())
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("pg_biba: LOAD is not permitted in enforcing mode")));
+					 errmsg("pg_mic: LOAD is not permitted in enforcing mode")));
 		}
 	}
 
@@ -254,26 +254,26 @@ _PG_init(void)
 	if (IsUnderPostmaster)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_biba must be loaded via \"shared_preload_libraries\"")));
+				 errmsg("pg_mic must be loaded via \"shared_preload_libraries\"")));
 
-	/* GUC: biba.mode */
-	DefineCustomEnumVariable("biba.mode",
+	/* GUC: mic.mode */
+	DefineCustomEnumVariable("mic.mode",
 							 "Biba integrity model enforcement mode",
 							 NULL,
-							 &biba_mode,
-							 BIBA_MODE_ENFORCING,
-							 biba_mode_options,
+							 &mic_mode,
+							 MIC_MODE_ENFORCING,
+							 mic_mode_options,
 							 PGC_SIGHUP,
 							 0,
 							 NULL,
 							 NULL,
 							 NULL);
 
-	/* GUC: biba.debug_audit */
-	DefineCustomBoolVariable("biba.debug_audit",
+	/* GUC: mic.debug_audit */
+	DefineCustomBoolVariable("mic.debug_audit",
 							 "Turn on/off debug audit messages for Biba checks",
 							 NULL,
-							 &biba_debug_audit,
+							 &mic_debug_audit,
 							 false,
 							 PGC_USERSET,
 							 0,
@@ -281,21 +281,21 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	MarkGUCPrefixReserved("biba");
+	MarkGUCPrefixReserved("mic");
 
 	/* Security label provider */
-	register_label_provider(BIBA_LABEL_TAG,
-							biba_object_relabel);
+	register_label_provider(MIC_LABEL_TAG,
+							mic_object_relabel);
 
 	/* Object access hook */
 	next_object_access_hook = object_access_hook;
-	object_access_hook = biba_object_access;
+	object_access_hook = mic_object_access;
 
 	/* DML permission check hook */
 	next_exec_check_perms_hook = ExecutorCheckPerms_hook;
-	ExecutorCheckPerms_hook = biba_exec_check_perms;
+	ExecutorCheckPerms_hook = mic_exec_check_perms;
 
 	/* ProcessUtility hook */
 	next_ProcessUtility_hook = ProcessUtility_hook;
-	ProcessUtility_hook = biba_utility_command;
+	ProcessUtility_hook = mic_utility_command;
 }
