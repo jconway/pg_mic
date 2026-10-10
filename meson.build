@@ -41,6 +41,7 @@ tests += {
     'tests': [
       't/001_preload.pl',
       't/002_modes.pl',
+      't/003_confused_deputy.pl',
     ],
   },
 }
