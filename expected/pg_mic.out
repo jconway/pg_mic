@@ -550,6 +550,24 @@ INSERT INTO r_at VALUES (1);
 ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_atchk" reached via ALTER TABLE on "r_at"
 ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
+-- ============================================================
+-- Bulk extension promotion
+-- ============================================================
+BEGIN;
+SELECT mic_promote_extension('pg_mic', 'high') >= 0 AS promoted_count_nonneg;
+ promoted_count_nonneg 
+-----------------------
+ t
+(1 row)
+
+ROLLBACK;
+SET ROLE mic_low_user;
+SELECT mic_promote_extension('pg_mic', 'high');   -- ERROR: superuser only
+ERROR:  pg_mic: only superuser can promote extensions
+RESET ROLE;
+SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
+ERROR:  pg_mic: "bogus" is not a valid integrity level
+HINT:  Valid levels are: low, medium, high.
 -- Cleanup
 DROP TABLE r_at;
 DROP FUNCTION public.low_atchk(int);

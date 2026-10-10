@@ -37,6 +37,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'mic_promote_object'
 LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION mic_promote_extension(ext_name text, new_level text)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'mic_promote_extension'
+LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION mic_initialize_labels()
 RETURNS void
 AS 'MODULE_PATHNAME', 'mic_initialize_labels'

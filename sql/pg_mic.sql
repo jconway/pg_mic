@@ -396,6 +396,17 @@ INSERT INTO r_at VALUES (1);
 ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
 ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
 
+-- ============================================================
+-- Bulk extension promotion
+-- ============================================================
+BEGIN;
+SELECT mic_promote_extension('pg_mic', 'high') >= 0 AS promoted_count_nonneg;
+ROLLBACK;
+SET ROLE mic_low_user;
+SELECT mic_promote_extension('pg_mic', 'high');   -- ERROR: superuser only
+RESET ROLE;
+SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
+
 -- Cleanup
 DROP TABLE r_at;
 DROP FUNCTION public.low_atchk(int);
