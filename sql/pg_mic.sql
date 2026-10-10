@@ -213,8 +213,31 @@ INSERT INTO r_chk_med VALUES (1);
 RESET ROLE;
 
 -- ============================================================
+-- Reachable-function enforcement: triggers (by event)
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_trig() RETURNS trigger
+    AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+CREATE FUNCTION public.low_trig_del() RETURNS trigger
+    AS 'BEGIN RETURN OLD; END' LANGUAGE plpgsql;
+RESET ROLE;
+CREATE TABLE r_trg (id int);
+CREATE TRIGGER t_ins BEFORE INSERT ON r_trg
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig();
+CREATE TRIGGER t_del BEFORE DELETE ON r_trg
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig_del();
+-- INSERT denied (LOW insert trigger)
+INSERT INTO r_trg VALUES (1);
+-- event filtering: DELETE must NOT be blocked by the INSERT trigger,
+-- but IS blocked by the LOW delete trigger
+DELETE FROM r_trg WHERE id = 1;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_trg;
+DROP FUNCTION public.low_trig();
+DROP FUNCTION public.low_trig_del();
 DROP TABLE r_chk;
 DROP TABLE r_chk_ok;
 DROP TABLE r_chk_hi;

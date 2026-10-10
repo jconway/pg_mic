@@ -21,6 +21,8 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_trigger.h"
+#include "commands/trigger.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -232,6 +234,34 @@ check_check_constraints(Relation rel, int subject_level)
 	}
 }
 
+/* Triggers on rel whose event matches the operation being performed */
+static void
+check_triggers(Relation rel, int subject_level, AclMode required_ops)
+{
+	TriggerDesc *td = rel->trigdesc;
+	int			i;
+
+	if (td == NULL)
+		return;
+	for (i = 0; i < td->numtriggers; i++)
+	{
+		Trigger    *tg = &td->triggers[i];
+		int16		t = tg->tgtype;
+		bool		want = false;
+
+		if ((required_ops & ACL_INSERT) && TRIGGER_FOR_INSERT(t))
+			want = true;
+		if ((required_ops & ACL_UPDATE) && TRIGGER_FOR_UPDATE(t))
+			want = true;
+		if ((required_ops & ACL_DELETE) && TRIGGER_FOR_DELETE(t))
+			want = true;
+		if (!want)
+			continue;
+		mic_check_one_function(tg->tgfoid, subject_level,
+							   "trigger on", RelationGetRelationName(rel));
+	}
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {
@@ -255,7 +285,8 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 
 	if (need_write)
 		check_check_constraints(rel, subject_level);
-	/* subsequent tasks add: triggers, defaults, generated, index, excl, RLS, domain */
+	check_triggers(rel, subject_level, required_ops);
+	/* subsequent tasks add: defaults, generated, index, excl, RLS, domain */
 
 	table_close(rel, AccessShareLock);
 }
