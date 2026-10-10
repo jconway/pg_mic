@@ -20,23 +20,64 @@
 #include "executor/executor.h"
 #include "nodes/nodes.h"
 #include "pg_mic.h"
+#include "pg_mic_compat.h"
 #include "utils/lsyscache.h"
+
+/*
+ * mic_perm_entries
+ *
+ * Version-independent view of the relations and permissions a query needs.
+ * PG16+ reads RTEPermissionInfo; earlier versions read RangeTblEntry.
+ */
+List *
+mic_perm_entries(List *rangeTabls, List *rteperminfos)
+{
+	List	   *out = NIL;
+	ListCell   *lc;
+
+#if PG_VERSION_NUM >= 160000
+	(void) rangeTabls;
+	foreach(lc, rteperminfos)
+	{
+		RTEPermissionInfo *pi = lfirst_node(RTEPermissionInfo, lc);
+		MicPermEntry *e = palloc(sizeof(MicPermEntry));
+
+		e->relid = pi->relid;
+		e->requiredPerms = pi->requiredPerms;
+		out = lappend(out, e);
+	}
+#else
+	(void) rteperminfos;
+	foreach(lc, rangeTabls)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		MicPermEntry *e;
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+		e = palloc(sizeof(MicPermEntry));
+		e->relid = rte->relid;
+		e->requiredPerms = rte->requiredPerms;
+		out = lappend(out, e);
+	}
+#endif
+	return out;
+}
 
 /*
  * mic_dml_privileges
  *
- * Entrypoint for DML permission checks.  Iterates over RTEPermissionInfo
- * entries and applies Biba checks based on the required permissions.
+ * Entrypoint for DML permission checks.  Iterates over MicPermEntry
+ * items and applies Biba checks based on the required permissions.
  */
 bool
-mic_dml_privileges(List *rangeTbls, List *rteperminfos,
-					bool abort_on_violation)
+mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 {
 	ListCell   *lr;
 
-	foreach(lr, rteperminfos)
+	foreach(lr, perm_entries)
 	{
-		RTEPermissionInfo *perminfo = lfirst_node(RTEPermissionInfo, lr);
+		MicPermEntry *perminfo = (MicPermEntry *) lfirst(lr);
 		Oid			relOid = perminfo->relid;
 		bool		need_read = false;
 		bool		need_write = false;

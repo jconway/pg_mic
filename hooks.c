@@ -20,14 +20,12 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pg_mic.h"
+#include "pg_mic_compat.h"
 #include "tcop/utility.h"
 #include "utils/guc.h"
 #include "utils/queryenvironment.h"
 
-PG_MODULE_MAGIC_EXT(
-					.name = "pg_mic",
-					.version = PG_VERSION
-);
+MIC_MODULE_MAGIC;
 
 /*
  * Saved hook entries (for chaining)
@@ -192,17 +190,20 @@ mic_object_access(ObjectAccessType access,
  *
  * ExecutorCheckPerms_hook callback: DML permission checks.
  */
-static bool
-mic_exec_check_perms(List *rangeTbls, List *rteperminfos, bool abort)
+MIC_CHECKPERMS_PROTO(mic_exec_check_perms)
 {
+	List	   *entries;
+
 	if (next_exec_check_perms_hook &&
-		!(*next_exec_check_perms_hook) (rangeTbls, rteperminfos, abort))
+		!MIC_CALL_NEXT_CHECKPERMS(next_exec_check_perms_hook,
+								  rangeTabls, rteperminfos, abort))
 		return false;
 
 	if (mic_mode == MIC_MODE_DISABLED)
 		return true;
 
-	if (!mic_dml_privileges(rangeTbls, rteperminfos, abort))
+	entries = MIC_PERM_ENTRIES(rangeTabls, rteperminfos);
+	if (!mic_dml_privileges(entries, abort))
 		return false;
 
 	return true;

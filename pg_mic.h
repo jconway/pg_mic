@@ -66,8 +66,7 @@ extern void mic_check_readwrite(Oid classId, Oid objectId);
 /*
  * dml.c
  */
-extern bool mic_dml_privileges(List *rangeTabls, List *rteperminfos,
-								bool abort_on_violation);
+extern bool mic_dml_privileges(List *perm_entries, bool abort_on_violation);
 
 /*
  * promote.c -- SQL-callable functions declared via PG_FUNCTION_INFO_V1
