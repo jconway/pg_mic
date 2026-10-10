@@ -613,3 +613,56 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 
 	table_close(rel, AccessShareLock);
 }
+
+/*
+ * REINDEX rebuilds under the table owner's identity, so the per-function
+ * runtime hook would see the owner's level rather than the invoking
+ * subject's.  Check the stored (resolved) index expressions/predicates of the
+ * target here, against the invoking subject.  relid is an index (is_index) or
+ * a table.
+ */
+void
+mic_check_reindex_exprs(Oid relid, bool is_index)
+{
+	int			subject_level;
+	Relation	rel;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	if (is_index)
+	{
+		Relation	irel = try_index_open(relid, AccessShareLock);
+		List	   *exprs;
+		List	   *pred;
+		ListCell   *lc;
+
+		if (irel == NULL)
+			return;
+		exprs = RelationGetIndexExpressions(irel);
+		pred = RelationGetIndexPredicate(irel);
+		foreach(lc, exprs)
+			mic_check_expr_functions((Node *) lfirst(lc), subject_level,
+									 "index expression on",
+									 RelationGetRelationName(irel));
+		foreach(lc, pred)
+			mic_check_expr_functions((Node *) lfirst(lc), subject_level,
+									 "index predicate on",
+									 RelationGetRelationName(irel));
+		index_close(irel, AccessShareLock);
+		return;
+	}
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+	check_index_exprs(rel, subject_level);
+	table_close(rel, AccessShareLock);
+}

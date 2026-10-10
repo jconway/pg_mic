@@ -20,7 +20,9 @@
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "parser/parse_func.h"
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
 #include "tcop/utility.h"
@@ -212,6 +214,35 @@ MIC_CHECKPERMS_PROTO(mic_exec_check_perms)
 }
 
 /*
+ * Best-effort walk of a raw (unanalyzed) CREATE INDEX expression/predicate:
+ * resolve each FuncCall by name and check it against the subject.  Anything
+ * that cannot be resolved is silently skipped (never an error); the runtime
+ * OAT_FUNCTION_EXECUTE hook remains the authoritative guard during the build.
+ */
+typedef struct RawFuncCtx
+{
+	int			subject_level;
+	const char *objname;
+} RawFuncCtx;
+
+static bool
+mic_raw_func_walker(Node *node, RawFuncCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncCall))
+	{
+		FuncCall   *fc = (FuncCall *) node;
+		Oid			fid = LookupFuncName(fc->funcname, -1, NULL, true);
+
+		if (OidIsValid(fid))
+			mic_check_one_function(fid, ctx->subject_level,
+								   "index definition on", ctx->objname);
+	}
+	return raw_expression_tree_walker(node, mic_raw_func_walker, ctx);
+}
+
+/*
  * mic_utility_command
  *
  * ProcessUtility_hook callback: block LOAD in enforcing mode.
@@ -252,6 +283,48 @@ mic_utility_command(PlannedStmt *pstmt,
 						if (OidIsValid(relid))
 							mic_check_reachable_functions(relid,
 														  cs->is_from ? ACL_INSERT : ACL_SELECT);
+					}
+					break;
+				}
+			case T_IndexStmt:
+				{
+					IndexStmt  *is = (IndexStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					if (lvl > MIC_LEVEL_LOW && is->relation != NULL)
+					{
+						RawFuncCtx	ctx;
+						ListCell   *lc;
+
+						ctx.subject_level = lvl;
+						ctx.objname = is->relation->relname;
+						foreach(lc, is->indexParams)
+						{
+							IndexElem  *ie = lfirst_node(IndexElem, lc);
+
+							if (ie->expr)
+								(void) mic_raw_func_walker(ie->expr, &ctx);
+						}
+						if (is->whereClause)
+							(void) mic_raw_func_walker(is->whereClause, &ctx);
+					}
+					break;
+				}
+			case T_ReindexStmt:
+				{
+					ReindexStmt *rs = (ReindexStmt *) parsetree;
+
+					if (rs->relation != NULL &&
+						(rs->kind == REINDEX_OBJECT_INDEX ||
+						 rs->kind == REINDEX_OBJECT_TABLE))
+					{
+						Oid			relid = RangeVarGetRelid(rs->relation,
+															 AccessShareLock,
+															 true);
+
+						if (OidIsValid(relid))
+							mic_check_reindex_exprs(relid,
+													rs->kind == REINDEX_OBJECT_INDEX);
 					}
 					break;
 				}

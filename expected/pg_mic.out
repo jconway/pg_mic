@@ -403,8 +403,13 @@ DROP TABLE r_gv;
 SET ROLE mic_low_user;
 CREATE FUNCTION public.low_ident(int) RETURNS int AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
 RESET ROLE;
+-- (CREATE INDEX with a LOW function is itself denied for a HIGH subject, so a
+-- LOW subject builds the table and index, then HIGH writes to it)
+SET ROLE mic_low_user;
 CREATE TABLE r_idx (id int);
 CREATE INDEX r_idx_e ON r_idx (public.low_ident(id));
+GRANT ALL ON r_idx TO PUBLIC;
+RESET ROLE;
 INSERT INTO r_idx VALUES (1);          -- denied: index maintenance
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ident" reached via index expression on "r_idx"
 -- partial-index predicate evaluated by planner on SELECT (scratch.txt vector)
@@ -505,8 +510,38 @@ CREATE TRIGGER t_tr BEFORE TRUNCATE ON r_trunc
 TRUNCATE r_trunc;                      -- denied: LOW truncate trigger
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc" reached via truncate trigger on "r_trunc"
 -- ============================================================
+-- Utility path: CREATE INDEX / REINDEX over existing rows
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_ixbuild(int) RETURNS int AS
+  $$ BEGIN RETURN $1; END $$ LANGUAGE plpgsql IMMUTABLE;
+RESET ROLE;
+CREATE TABLE r_ixb (id int);
+INSERT INTO r_ixb SELECT g FROM generate_series(1,3) g;
+CREATE INDEX r_ixb_e ON r_ixb (public.low_ixbuild(id));              -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ixbuild" reached via index definition on "r_ixb"
+CREATE INDEX r_ixb_p ON r_ixb (id) WHERE public.low_ixbuild(id) > 0; -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ixbuild" reached via index definition on "r_ixb"
+-- REINDEX: a LOW subject builds a LOW expression index (allowed), then a
+-- HIGH subject reindexes it
+SET ROLE mic_low_user;
+CREATE FUNCTION public.ixr_fn(int) RETURNS int AS
+  $$ BEGIN RETURN $1; END $$ LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE r_ixr (id int);
+INSERT INTO r_ixr SELECT g FROM generate_series(1,3) g;
+CREATE INDEX r_ixr_e ON r_ixr (public.ixr_fn(id));                   -- allowed (LOW)
+RESET ROLE;
+REINDEX INDEX r_ixr_e;                                               -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "ixr_fn" reached via index expression on "r_ixr_e"
+REINDEX TABLE r_ixr;                                                 -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "ixr_fn" reached via index expression on "r_ixr"
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_ixb;
+DROP TABLE r_ixr;
+DROP FUNCTION public.low_ixbuild(int);
+DROP FUNCTION public.ixr_fn(int);
 DROP TABLE r_copy;
 DROP TABLE r_trunc;
 DROP FUNCTION public.low_copychk(int);
