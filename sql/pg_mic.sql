@@ -304,6 +304,18 @@ CREATE TABLE r_dom (id public.low_dom);
 INSERT INTO r_dom VALUES (1);          -- denied: domain CHECK reaches LOW fn
 
 -- ============================================================
+-- Reachable-function enforcement: cast to domain inside an expression
+-- (T_CoerceToDomain; the column type is plain int, not the domain)
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_domchk2(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+CREATE DOMAIN public.low_dom2 AS int CHECK (public.low_domchk2(VALUE));
+RESET ROLE;
+CREATE TABLE r_domcast (x int CHECK ((x::public.low_dom2) >= 0));
+INSERT INTO r_domcast VALUES (1);      -- denied: cast-to-domain CHECK reaches LOW fn
+
+-- ============================================================
 -- Reachable-function enforcement: RLS policies
 -- ============================================================
 SET ROLE mic_low_user;
@@ -395,6 +407,8 @@ CREATE TABLE r_at (id int);
 INSERT INTO r_at VALUES (1);
 ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
 ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
+ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.low_atchk(1)::int::int + 0;  -- denied: bare raw default walked
+ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.nosuchfn(1);  -- unresolvable name: plain parse error, not a pg_mic error
 
 -- ============================================================
 -- Bulk extension promotion
@@ -437,6 +451,9 @@ DROP TABLE r_rls_pri;
 DROP ROLE mic_rls_high;
 DROP TABLE r_rls;
 DROP FUNCTION public.low_rls(int);
+DROP TABLE r_domcast;
+DROP DOMAIN public.low_dom2;
+DROP FUNCTION public.low_domchk2(int);
 DROP TABLE r_dom;
 DROP DOMAIN public.low_dom;
 DROP FUNCTION public.low_domchk(int);

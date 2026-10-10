@@ -368,6 +368,11 @@ mic_utility_command(PlannedStmt *pstmt,
 												(void) mic_raw_func_walker(c->raw_expr, &ctx);
 											}
 										}
+										else
+										{
+											/* bare raw expression (SET DEFAULT / SET EXPRESSION) */
+											(void) mic_raw_func_walker(cmd->def, &ctx);
+										}
 									}
 									mic_check_reachable_functions(relid,
 																  ACL_INSERT | ACL_UPDATE);

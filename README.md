@@ -221,7 +221,7 @@ SELECT mic_promote_extension('some_ext', 'high');  -- returns count of objects r
 ```
 
 `mic_promote_extension(ext_name text, new_level text) RETURNS integer` is
-superuser-only. It relabels every object belonging to the named extension to
+superuser-only. It relabels every labelable member belonging to the named extension to
 the given level and returns the number of objects relabeled.
 
 ## Example
@@ -261,7 +261,7 @@ RESET ROLE;
 | `mic_set_role_level(role_name text, level text)` | void | Set a role's level (superuser only) |
 | `mic_promote_table(table_name text, new_level text)` | void | Set a table's level (superuser only) |
 | `mic_promote_object(class_id oid, object_id oid, new_level text)` | void | Set any object's level (superuser only) |
-| `mic_promote_extension(ext_name text, new_level text)` | integer | Relabel all objects of an extension; returns count (superuser only) |
+| `mic_promote_extension(ext_name text, new_level text)` | integer | Relabel every labelable member of an extension; returns count (superuser only) |
 | `mic_initialize_labels()` | void | Label all unlabeled user tables (superuser only) |
 
 ## Supported Versions

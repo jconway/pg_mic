@@ -82,6 +82,57 @@ collect_aggregate(FuncCollectCtx *ctx, Oid aggfnoid)
 	}
 }
 
+static bool func_collect_walker(Node *node, FuncCollectCtx *ctx);
+
+/*
+ * Append the functions reachable from a domain's CHECK constraints (and those
+ * of any underlying domains) to ctx.  Fail-safe: a missing conbin collects
+ * nothing and never raises an error.
+ */
+static void
+collect_domain_check_funcs(Oid typid, FuncCollectCtx *ctx)
+{
+	int			depth = 0;
+
+	while (depth++ < 32 && get_typtype(typid) == TYPTYPE_DOMAIN)
+	{
+		Relation	conrel;
+		ScanKeyData skey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		conrel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&skey, Anum_pg_constraint_contypid,
+					BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(typid));
+		scan = systable_beginscan(conrel, ConstraintTypidIndexId, true,
+								  NULL, 1, &skey);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(tup);
+			Datum		val;
+			bool		isnull;
+
+			if (c->contype != CONSTRAINT_CHECK)
+				continue;
+			val = heap_getattr(tup, Anum_pg_constraint_conbin,
+							   RelationGetDescr(conrel), &isnull);
+			if (isnull)
+				continue;
+			(void) func_collect_walker(stringToNode(TextDatumGetCString(val)),
+									   ctx);
+		}
+		systable_endscan(scan);
+		table_close(conrel, AccessShareLock);
+
+		/* step to the immediate parent type (may itself be a domain) */
+		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (!HeapTupleIsValid(tup))
+			break;
+		typid = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+		ReleaseSysCache(tup);
+	}
+}
+
 static bool
 func_collect_walker(Node *node, FuncCollectCtx *ctx)
 {
@@ -157,6 +208,10 @@ func_collect_walker(Node *node, FuncCollectCtx *ctx)
 				ctx->funcids = lappend_oid(ctx->funcids, outfn);
 				break;
 			}
+		case T_CoerceToDomain:
+			collect_domain_check_funcs(((CoerceToDomain *) node)->resulttype,
+									   ctx);
+			break;
 		default:
 			break;
 	}
