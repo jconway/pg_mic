@@ -1,7 +1,7 @@
 # pg_mic -- Biba Mandatory Integrity Model for PostgreSQL
 
-`pg_mic` is a PostgreSQL extension that enforces the Biba mandatory integrity
-model. The Biba model is the dual of Bell-LaPadula: it protects data
+`pg_mic` is a PostgreSQL extension that enforces a mandatory integrity model
+in the tradition of Biba. The Biba model is the dual of Bell-LaPadula: it protects data
 **integrity** rather than confidentiality. It prevents high-integrity subjects
 from being contaminated by low-integrity data, and prevents low-integrity
 subjects from corrupting high-integrity data.
@@ -45,15 +45,37 @@ DML mapping:
 - **UPDATE** -- read + write check
 - **DROP / ALTER / TRUNCATE** -- write check
 
-Operation mapping:
+### Function Execution and Indirect Enforcement
 
-- **Function execution** -- read check. A function is an object like any
-  other, so invoking one obeys No Read Down: a HIGH subject cannot execute
-  a LOW-integrity function. This blocks confused-deputy attacks in which a
-  high-integrity subject is lured into running untrusted, low-integrity
-  code (for example a function planted in an index predicate or trigger by
-  a low-integrity user). Built-in functions (OID < 16384) are exempt, so
-  ordinary SQL continues to work for all users.
+A function is an object like any other, so invoking one obeys No Read Down:
+a HIGH subject cannot cause a function below its level to execute. This blocks
+confused-deputy attacks in which a high-integrity subject is lured into running
+untrusted, low-integrity code planted by a low-integrity user.
+
+The rule covers not only functions named in the query but also **indirect,
+non-obvious paths** where the server runs a function on the subject's behalf.
+These are enforced **statically**, by reading the stored catalog expressions of
+every relation the statement touches, so the check is **immune to SQL-function
+inlining** (the planner may inline a function and make it vanish from the plan;
+the catalog expression still names it). A runtime function-execution hook is
+retained as a backstop.
+
+Covered attachment points:
+
+- triggers (including TRUNCATE triggers)
+- CHECK constraints
+- column defaults
+- STORED and VIRTUAL generated columns
+- index expressions and index predicates
+- exclusion-constraint operators
+- RLS `USING` / `WITH CHECK` policies
+- domain CHECK constraints
+
+Built-in functions (OID < 16384) are exempt, so ordinary SQL works for all
+users. Enforcement is driven from both the executor (DML) and ProcessUtility
+(COPY, TRUNCATE, CREATE INDEX / REINDEX, and ALTER TABLE validate/rewrite
+subcommands), since those utility commands run catalog-stored code over rows
+without going through the normal executor checks.
 
 ## Installation
 
@@ -188,6 +210,20 @@ For objects other than tables:
 SELECT mic_promote_object(class_id, object_id, 'high');
 ```
 
+### Vetting and Promoting a Trusted Extension
+
+An extension installed by a low-trust user has its objects (functions, tables,
+...) labeled LOW, so high-integrity users cannot use it. After reviewing the
+extension, a superuser can promote everything it owns in one call:
+
+```sql
+SELECT mic_promote_extension('some_ext', 'high');  -- returns count of objects relabeled
+```
+
+`mic_promote_extension(ext_name text, new_level text) RETURNS integer` is
+superuser-only. It relabels every object belonging to the named extension to
+the given level and returns the number of objects relabeled.
+
 ## Example
 
 ```sql
@@ -225,7 +261,36 @@ RESET ROLE;
 | `mic_set_role_level(role_name text, level text)` | void | Set a role's level (superuser only) |
 | `mic_promote_table(table_name text, new_level text)` | void | Set a table's level (superuser only) |
 | `mic_promote_object(class_id oid, object_id oid, new_level text)` | void | Set any object's level (superuser only) |
+| `mic_promote_extension(ext_name text, new_level text)` | integer | Relabel all objects of an extension; returns count (superuser only) |
 | `mic_initialize_labels()` | void | Label all unlabeled user tables (superuser only) |
+
+## Supported Versions
+
+PostgreSQL 14 through master. Currently validated on 15, 16, 17, and master;
+version differences are handled with guards in `pg_mic_compat.h`.
+
+## Limitations and Non-Escapes
+
+- **Nested inlined SQL is NOT an escape.** A LOW SQL function reached only by
+  inlining inside an allowed function is read-only, and any table access or
+  non-inlined call it performs is independently enforced (executor table check
+  / runtime hook). No static body recursion is done or needed.
+- **Custom base-type I/O functions are not an attack vector.** Creating a base
+  type requires superuser, so its I/O functions are HIGH.
+- **VIRTUAL generated columns** cannot reference user-defined functions in
+  PostgreSQL (the server rejects them), so that read-path vector is moot in
+  practice; a defensive check remains.
+- **RLS enforcement is conservative (over-approximate).** Every policy on an
+  RLS-enabled relation is checked; BYPASSRLS, FORCE ROW LEVEL SECURITY,
+  per-policy command (`polcmd`), and per-policy role applicability are not
+  modeled. A subject that would actually bypass a policy may still be denied if
+  the policy references a lower-integrity function (fail-closed).
+- **The utility path covers an enumerated set** of commands/subcommands. A new
+  PostgreSQL command that executes code over rows would need to be added to
+  that enumeration.
+- **Not followed:** nested domains (a domain over a domain); arrays/ranges of
+  domains; TRUNCATE triggers on partitions, inheritance children, or
+  CASCADE-reached foreign-key tables; REINDEX SCHEMA / DATABASE / SYSTEM.
 
 ## Running Tests
 
