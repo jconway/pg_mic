@@ -440,8 +440,24 @@ CREATE TABLE r_dom (id public.low_dom);
 INSERT INTO r_dom VALUES (1);          -- denied: domain CHECK reaches LOW fn
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_domchk" reached via domain CHECK on "r_dom"
 -- ============================================================
+-- Reachable-function enforcement: RLS policies
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_rls(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql STABLE;
+RESET ROLE;
+CREATE TABLE r_rls (id int);
+ALTER TABLE r_rls ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_sel ON r_rls FOR SELECT USING (public.low_rls(id));
+INSERT INTO r_rls VALUES (1);
+ALTER TABLE r_rls FORCE ROW LEVEL SECURITY;
+SELECT count(*) FROM r_rls;            -- denied: USING qual reaches LOW fn
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_rls" reached via RLS USING policy on "r_rls"
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_rls;
+DROP FUNCTION public.low_rls(int);
 DROP TABLE r_dom;
 DROP DOMAIN public.low_dom;
 DROP FUNCTION public.low_domchk(int);

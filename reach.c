@@ -23,6 +23,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_policy.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_type.h"
 #include "access/skey.h"
@@ -35,6 +36,7 @@
 #include "nodes/nodes.h"
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
+#include "rewrite/rowsecurity.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -465,6 +467,81 @@ check_exclusion_ops(Relation rel, int subject_level)
 	table_close(conrel, AccessShareLock);
 }
 
+/*
+ * RLS policies: USING quals run on read-ish ops, WITH CHECK quals on write
+ * ops.  rd_rsdesc is built lazily (and not at all when the subject bypasses
+ * RLS), so if it is absent but the relation has row security, scan pg_policy.
+ */
+static void
+check_rls_policies(Relation rel, int subject_level, AclMode required_ops)
+{
+	bool		is_read = (required_ops & (ACL_SELECT | ACL_UPDATE | ACL_DELETE)) != 0;
+	bool		is_write = (required_ops & (ACL_INSERT | ACL_UPDATE)) != 0;
+	const char *relname = RelationGetRelationName(rel);
+
+	if (rel->rd_rsdesc != NULL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, rel->rd_rsdesc->policies)
+		{
+			RowSecurityPolicy *p = (RowSecurityPolicy *) lfirst(lc);
+
+			if (is_read && p->qual)
+				mic_check_expr_functions((Node *) p->qual, subject_level,
+										 "RLS USING policy on", relname);
+			if (is_write && p->with_check_qual)
+				mic_check_expr_functions((Node *) p->with_check_qual,
+										 subject_level,
+										 "RLS WITH CHECK policy on", relname);
+		}
+		return;
+	}
+
+	if (!rel->rd_rel->relrowsecurity)
+		return;
+
+	{
+		Relation	polrel;
+		ScanKeyData skey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		polrel = table_open(PolicyRelationId, AccessShareLock);
+		ScanKeyInit(&skey, Anum_pg_policy_polrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(RelationGetRelid(rel)));
+		scan = systable_beginscan(polrel, PolicyPolrelidPolnameIndexId, true,
+								  NULL, 1, &skey);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Datum		val;
+			bool		isnull;
+
+			if (is_read)
+			{
+				val = heap_getattr(tup, Anum_pg_policy_polqual,
+								   RelationGetDescr(polrel), &isnull);
+				if (!isnull)
+					mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
+											 subject_level,
+											 "RLS USING policy on", relname);
+			}
+			if (is_write)
+			{
+				val = heap_getattr(tup, Anum_pg_policy_polwithcheck,
+								   RelationGetDescr(polrel), &isnull);
+				if (!isnull)
+					mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
+											 subject_level,
+											 "RLS WITH CHECK policy on", relname);
+			}
+		}
+		systable_endscan(scan);
+		table_close(polrel, AccessShareLock);
+	}
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {
@@ -496,7 +573,7 @@ mic_check_reachable_functions(Oid relid, AclMode required_ops)
 		check_domain_checks(rel, subject_level);
 		check_exclusion_ops(rel, subject_level);
 	}
-	/* subsequent tasks add: RLS */
+	check_rls_policies(rel, subject_level, required_ops);
 
 	table_close(rel, AccessShareLock);
 }
