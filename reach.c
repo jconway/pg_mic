@@ -542,6 +542,42 @@ check_rls_policies(Relation rel, int subject_level, AclMode required_ops)
 	}
 }
 
+/* TRUNCATE-event triggers (not an ExecutorCheckPerms operation) */
+void
+mic_check_truncate_triggers(Oid relid)
+{
+	int			subject_level;
+	Relation	rel;
+	TriggerDesc *td;
+	int			i;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+
+	td = rel->trigdesc;
+	for (i = 0; td != NULL && i < td->numtriggers; i++)
+	{
+		Trigger    *tg = &td->triggers[i];
+
+		if (TRIGGER_FOR_TRUNCATE(tg->tgtype))
+			mic_check_one_function(tg->tgfoid, subject_level,
+								   "truncate trigger on",
+								   RelationGetRelationName(rel));
+	}
+	table_close(rel, AccessShareLock);
+}
+
 void
 mic_check_reachable_functions(Oid relid, AclMode required_ops)
 {

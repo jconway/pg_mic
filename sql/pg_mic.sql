@@ -336,8 +336,30 @@ INSERT INTO r_rls_ok VALUES (1);       -- allowed
 RESET ROLE;
 
 -- ============================================================
+-- Utility path: COPY FROM and TRUNCATE triggers
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_copychk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+CREATE FUNCTION public.low_trunc() RETURNS trigger
+    AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
+RESET ROLE;
+CREATE TABLE r_copy (id int CHECK (public.low_copychk(id)));
+COPY r_copy FROM STDIN;
+1
+\.
+CREATE TABLE r_trunc (id int);
+CREATE TRIGGER t_tr BEFORE TRUNCATE ON r_trunc
+    FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc();
+TRUNCATE r_trunc;                      -- denied: LOW truncate trigger
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
+DROP TABLE r_copy;
+DROP TABLE r_trunc;
+DROP FUNCTION public.low_copychk(int);
+DROP FUNCTION public.low_trunc();
 DROP TABLE r_rls_ok;
 DROP TABLE r_rls_pri;
 DROP ROLE mic_rls_high;

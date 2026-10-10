@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "catalog/dependency.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
@@ -19,6 +20,7 @@
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
 #include "tcop/utility.h"
@@ -233,6 +235,44 @@ mic_utility_command(PlannedStmt *pstmt,
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("pg_mic: LOAD is not permitted in enforcing mode")));
+		}
+
+		switch (nodeTag(parsetree))
+		{
+			case T_CopyStmt:
+				{
+					CopyStmt   *cs = (CopyStmt *) parsetree;
+
+					if (cs->relation)	/* COPY table, not COPY (query) */
+					{
+						Oid			relid = RangeVarGetRelid(cs->relation,
+															 AccessShareLock,
+															 true);
+
+						if (OidIsValid(relid))
+							mic_check_reachable_functions(relid,
+														  cs->is_from ? ACL_INSERT : ACL_SELECT);
+					}
+					break;
+				}
+			case T_TruncateStmt:
+				{
+					TruncateStmt *ts = (TruncateStmt *) parsetree;
+					ListCell   *lc;
+
+					foreach(lc, ts->relations)
+					{
+						RangeVar   *rv = lfirst_node(RangeVar, lc);
+						Oid			relid = RangeVarGetRelid(rv, AccessShareLock,
+															 true);
+
+						if (OidIsValid(relid))
+							mic_check_truncate_triggers(relid);
+					}
+					break;
+				}
+			default:
+				break;
 		}
 	}
 
