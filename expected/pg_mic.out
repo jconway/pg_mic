@@ -522,6 +522,10 @@ CREATE INDEX r_ixb_e ON r_ixb (public.low_ixbuild(id));              -- denied
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ixbuild" reached via index definition on "r_ixb"
 CREATE INDEX r_ixb_p ON r_ixb (id) WHERE public.low_ixbuild(id) > 0; -- denied
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ixbuild" reached via index definition on "r_ixb"
+-- built-in overloaded function must not be over-denied for a HIGH subject
+CREATE TABLE r_idx_builtin (t text);
+INSERT INTO r_idx_builtin VALUES ('aB');
+CREATE INDEX r_idx_builtin_e ON r_idx_builtin (lower(t));            -- allowed
 -- REINDEX: a LOW subject builds a LOW expression index (allowed), then a
 -- HIGH subject reindexes it
 SET ROLE mic_low_user;
@@ -539,6 +543,7 @@ ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integ
 -- Cleanup
 -- ============================================================
 DROP TABLE r_ixb;
+DROP TABLE r_idx_builtin;
 DROP TABLE r_ixr;
 DROP FUNCTION public.low_ixbuild(int);
 DROP FUNCTION public.ixr_fn(int);

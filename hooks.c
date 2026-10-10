@@ -233,10 +233,14 @@ mic_raw_func_walker(Node *node, RawFuncCtx *ctx)
 	if (IsA(node, FuncCall))
 	{
 		FuncCall   *fc = (FuncCall *) node;
-		Oid			fid = LookupFuncName(fc->funcname, -1, NULL, true);
+		int			fgc_flags = 0;
+		FuncCandidateList cands;
 
-		if (OidIsValid(fid))
-			mic_check_one_function(fid, ctx->subject_level,
+		/* never errors on ambiguity; skip unless exactly one candidate */
+		cands = FuncnameGetCandidates(fc->funcname, -1, NIL, false, false,
+									  false, true, &fgc_flags);
+		if (cands != NULL && cands->next == NULL)
+			mic_check_one_function(cands->oid, ctx->subject_level,
 								   "index definition on", ctx->objname);
 	}
 	return raw_expression_tree_walker(node, mic_raw_func_walker, ctx);

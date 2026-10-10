@@ -369,6 +369,10 @@ CREATE TABLE r_ixb (id int);
 INSERT INTO r_ixb SELECT g FROM generate_series(1,3) g;
 CREATE INDEX r_ixb_e ON r_ixb (public.low_ixbuild(id));              -- denied
 CREATE INDEX r_ixb_p ON r_ixb (id) WHERE public.low_ixbuild(id) > 0; -- denied
+-- built-in overloaded function must not be over-denied for a HIGH subject
+CREATE TABLE r_idx_builtin (t text);
+INSERT INTO r_idx_builtin VALUES ('aB');
+CREATE INDEX r_idx_builtin_e ON r_idx_builtin (lower(t));            -- allowed
 -- REINDEX: a LOW subject builds a LOW expression index (allowed), then a
 -- HIGH subject reindexes it
 SET ROLE mic_low_user;
@@ -385,6 +389,7 @@ REINDEX TABLE r_ixr;                                                 -- denied
 -- Cleanup
 -- ============================================================
 DROP TABLE r_ixb;
+DROP TABLE r_idx_builtin;
 DROP TABLE r_ixr;
 DROP FUNCTION public.low_ixbuild(int);
 DROP FUNCTION public.ixr_fn(int);
