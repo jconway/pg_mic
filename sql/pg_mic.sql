@@ -402,6 +402,18 @@ ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
 BEGIN;
 SELECT mic_promote_extension('pg_mic', 'high') >= 0 AS promoted_count_nonneg;
 ROLLBACK;
+-- membership: demote one member to LOW, bulk-promote, verify it is HIGH again
+BEGIN;
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'mic_get_session_level'::regproc::oid, 'low');
+SELECT integrity_level AS before_promote FROM mic_labels
+  WHERE classoid = 'pg_catalog.pg_proc'::regclass
+    AND objoid = 'mic_get_session_level'::regproc::oid;
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_some;
+SELECT integrity_level AS after_promote FROM mic_labels
+  WHERE classoid = 'pg_catalog.pg_proc'::regclass
+    AND objoid = 'mic_get_session_level'::regproc::oid;
+ROLLBACK;
 SET ROLE mic_low_user;
 SELECT mic_promote_extension('pg_mic', 'high');   -- ERROR: superuser only
 RESET ROLE;

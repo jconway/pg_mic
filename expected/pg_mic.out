@@ -561,6 +561,38 @@ SELECT mic_promote_extension('pg_mic', 'high') >= 0 AS promoted_count_nonneg;
 (1 row)
 
 ROLLBACK;
+-- membership: demote one member to LOW, bulk-promote, verify it is HIGH again
+BEGIN;
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'mic_get_session_level'::regproc::oid, 'low');
+ mic_promote_object 
+--------------------
+ 
+(1 row)
+
+SELECT integrity_level AS before_promote FROM mic_labels
+  WHERE classoid = 'pg_catalog.pg_proc'::regclass
+    AND objoid = 'mic_get_session_level'::regproc::oid;
+ before_promote 
+----------------
+ low
+(1 row)
+
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_some;
+ promoted_some 
+---------------
+ t
+(1 row)
+
+SELECT integrity_level AS after_promote FROM mic_labels
+  WHERE classoid = 'pg_catalog.pg_proc'::regclass
+    AND objoid = 'mic_get_session_level'::regproc::oid;
+ after_promote 
+---------------
+ high
+(1 row)
+
+ROLLBACK;
 SET ROLE mic_low_user;
 SELECT mic_promote_extension('pg_mic', 'high');   -- ERROR: superuser only
 ERROR:  pg_mic: only superuser can promote extensions
