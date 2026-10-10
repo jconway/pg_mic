@@ -232,10 +232,23 @@ INSERT INTO r_trg VALUES (1);
 -- but IS blocked by the LOW delete trigger
 DELETE FROM r_trg WHERE id = 1;
 
+-- event filtering proof: table with ONLY a LOW insert trigger; a HIGH
+-- DELETE must SUCCEED (insert trigger not consulted for DELETE)
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_trig_ins_only() RETURNS trigger
+    AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+RESET ROLE;
+CREATE TABLE r_trg_insonly (id int);
+CREATE TRIGGER t_ins_only BEFORE INSERT ON r_trg_insonly
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig_ins_only();
+DELETE FROM r_trg_insonly WHERE id = 0;
+
 -- ============================================================
 -- Cleanup
 -- ============================================================
 DROP TABLE r_trg;
+DROP TABLE r_trg_insonly;
+DROP FUNCTION public.low_trig_ins_only();
 DROP FUNCTION public.low_trig();
 DROP FUNCTION public.low_trig_del();
 DROP TABLE r_chk;
