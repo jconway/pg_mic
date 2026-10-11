@@ -24,6 +24,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_func.h"
+#include "parser/parse_type.h"
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
 #include "tcop/utility.h"
@@ -361,6 +362,23 @@ mic_walk_constraint(Constraint *c, RawFuncCtx *ctx)
 	}
 }
 
+/*
+ * A definition derived from another relation (LIKE, INHERITS, PARTITION OF,
+ * ATTACH PARTITION, INHERIT) reads that relation's definition and adopts its
+ * stored code, so it is both a read of that object and a reach into every
+ * function its constraints, defaults and indexes name.
+ */
+static void
+mic_check_source_relation(RangeVar *rv)
+{
+	Oid			relid = RangeVarGetRelid(rv, AccessShareLock, true);
+
+	if (!OidIsValid(relid))
+		return;
+	mic_check_read(RelationRelationId, relid);
+	mic_check_reachable_functions(relid, ACL_INSERT | ACL_UPDATE);
+}
+
 /* Check the stored index expressions of every relation in a tree. */
 static void
 mic_check_tree_index_exprs(Oid relid, bool inh)
@@ -426,6 +444,71 @@ mic_utility_command(PlannedStmt *pstmt,
 							list_free(rels);
 						}
 					}
+					break;
+				}
+			case T_CreateStmt:
+				{
+					/*
+					 * Refuse to define a table in terms of a lower function:
+					 * column defaults, generated columns, CHECK/EXCLUDE
+					 * constraints, the partition key, a column type whose
+					 * domain CHECKs reach one, and anything adopted from a
+					 * LIKE source, an INHERITS parent, or a PARTITION OF
+					 * parent.  Nothing runs here yet; this is the symmetric
+					 * definition-time refusal CREATE TRIGGER already has.
+					 */
+					CreateStmt *cs = (CreateStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+					RawFuncCtx	ctx;
+					ListCell   *lc;
+
+					if (lvl <= MIC_LEVEL_LOW)
+						break;
+					ctx.subject_level = lvl;
+					ctx.objname = cs->relation->relname;
+					ctx.what = "CREATE TABLE";
+					foreach(lc, cs->tableElts)
+					{
+						Node	   *elt = (Node *) lfirst(lc);
+
+						if (IsA(elt, ColumnDef))
+						{
+							ColumnDef  *cd = (ColumnDef *) elt;
+							ListCell   *lc2;
+							Oid			typid;
+
+							(void) mic_raw_func_walker(cd->raw_default, &ctx);
+							foreach(lc2, cd->constraints)
+								mic_walk_constraint(lfirst_node(Constraint, lc2), &ctx);
+							typid = cd->typeName ?
+								LookupTypeNameOid(NULL, cd->typeName, true) : InvalidOid;
+							if (OidIsValid(typid))
+								mic_check_column_type(typid, lvl, cs->relation->relname);
+						}
+						else if (IsA(elt, Constraint))
+							mic_walk_constraint((Constraint *) elt, &ctx);
+						else if (IsA(elt, TableLikeClause))
+							mic_check_source_relation(((TableLikeClause *) elt)->relation);
+					}
+					if (cs->partspec != NULL)
+					{
+						foreach(lc, cs->partspec->partParams)
+						{
+							PartitionElem *pe = lfirst_node(PartitionElem, lc);
+
+							if (pe->expr)
+								(void) mic_raw_func_walker(pe->expr, &ctx);
+						}
+					}
+					if (cs->ofTypename != NULL)
+					{
+						Oid			typid = LookupTypeNameOid(NULL, cs->ofTypename, true);
+
+						if (OidIsValid(typid))
+							mic_check_column_type(typid, lvl, cs->relation->relname);
+					}
+					foreach(lc, cs->inhRelations)
+						mic_check_source_relation(lfirst_node(RangeVar, lc));
 					break;
 				}
 			case T_IndexStmt:
@@ -512,6 +595,21 @@ mic_utility_command(PlannedStmt *pstmt,
 																		  ACL_INSERT | ACL_UPDATE);
 										list_free(rels);
 									}
+								}
+								break;
+							case AT_AttachPartition:
+							case AT_AddInherit:
+								{
+									RangeVar   *other = NULL;
+
+									if (at->objtype != OBJECT_TABLE || cmd->def == NULL)
+										break;
+									if (IsA(cmd->def, PartitionCmd))
+										other = ((PartitionCmd *) cmd->def)->name;
+									else if (IsA(cmd->def, RangeVar))
+										other = (RangeVar *) cmd->def;
+									if (other != NULL && mic_get_subject_level() > MIC_LEVEL_LOW)
+										mic_check_source_relation(other);
 								}
 								break;
 							default:
@@ -646,6 +744,79 @@ mic_utility_command(PlannedStmt *pstmt,
 							else
 								(void) mic_raw_func_walker(e, &ctx);
 						}
+					}
+					break;
+				}
+			case T_CreatePolicyStmt:
+			case T_AlterPolicyStmt:
+				{
+					/* RLS quals run on every row access, in the executor */
+					Node	   *qual;
+					Node	   *with_check;
+					const char *polname;
+					int			lvl = mic_get_subject_level();
+
+					if (nodeTag(parsetree) == T_CreatePolicyStmt)
+					{
+						CreatePolicyStmt *cp = (CreatePolicyStmt *) parsetree;
+
+						qual = cp->qual;
+						with_check = cp->with_check;
+						polname = cp->policy_name;
+					}
+					else
+					{
+						AlterPolicyStmt *ap = (AlterPolicyStmt *) parsetree;
+
+						qual = ap->qual;
+						with_check = ap->with_check;
+						polname = ap->policy_name;
+					}
+					if (lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+
+						ctx.subject_level = lvl;
+						ctx.objname = polname;
+						ctx.what = "policy";
+						(void) mic_raw_func_walker(qual, &ctx);
+						(void) mic_raw_func_walker(with_check, &ctx);
+					}
+					break;
+				}
+			case T_CreateDomainStmt:
+				{
+					CreateDomainStmt *cd = (CreateDomainStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					if (lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+						ListCell   *lc;
+
+						ctx.subject_level = lvl;
+						ctx.objname = strVal(llast(cd->domainname));
+						ctx.what = "CREATE DOMAIN";
+						foreach(lc, cd->constraints)
+							mic_walk_constraint(lfirst_node(Constraint, lc), &ctx);
+					}
+					break;
+				}
+			case T_AlterDomainStmt:
+				{
+					AlterDomainStmt *ad = (AlterDomainStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					/* subtype 'C' = ADD CONSTRAINT; def is the Constraint */
+					if (ad->subtype == 'C' && ad->def != NULL &&
+						IsA(ad->def, Constraint) && lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+
+						ctx.subject_level = lvl;
+						ctx.objname = strVal(llast(ad->typeName));
+						ctx.what = "ALTER DOMAIN";
+						mic_walk_constraint((Constraint *) ad->def, &ctx);
 					}
 					break;
 				}

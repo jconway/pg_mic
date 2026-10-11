@@ -187,16 +187,25 @@ SET ROLE mic_low_user;
 CREATE FUNCTION public.low_sql_chk(int) RETURNS boolean
     AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
 RESET ROLE;
-CREATE TABLE r_chk (id int CHECK (public.low_sql_chk(id)));
+-- a HIGH subject may not even define a table in terms of a LOW function
+CREATE TABLE r_chk (id int CHECK (public.low_sql_chk(id)));   -- denied at CREATE TABLE
+-- so wire a HIGH function in, then demote it: the stored CHECK now reaches
+-- a LOW function (the realistic "trusted helper turned out bad" case)
+CREATE FUNCTION public.high_chk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;  -- created by superuser => HIGH
+CREATE TABLE r_chk (id int CHECK (public.high_chk(id)));
+INSERT INTO r_chk VALUES (1);          -- allowed: HIGH helper
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.high_chk(int)'::regprocedure::oid, 'low');
 -- HIGH subject INSERT must be denied (CHECK reaches a LOW function)
 INSERT INTO r_chk VALUES (1);
 -- a built-in-only CHECK must still work for HIGH
 CREATE TABLE r_chk_ok (id int CHECK (id >= 0));
 INSERT INTO r_chk_ok VALUES (1);
 -- a HIGH helper in a CHECK must work for HIGH
-CREATE FUNCTION public.high_chk(int) RETURNS boolean
-    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;  -- created by superuser => HIGH
-CREATE TABLE r_chk_hi (id int CHECK (public.high_chk(id)));
+CREATE FUNCTION public.high_chk2(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+CREATE TABLE r_chk_hi (id int CHECK (public.high_chk2(id)));
 INSERT INTO r_chk_hi VALUES (1);
 -- HIGH subject UPDATE must also be denied
 UPDATE r_chk SET id = 2;
@@ -208,8 +217,14 @@ RESET ROLE;
 -- MEDIUM subject must be denied for a LOW function in a CHECK
 GRANT CREATE, USAGE ON SCHEMA public TO mic_medium_user;
 SET ROLE mic_medium_user;
+CREATE TABLE r_chk_med (id int CHECK (public.low_sql_chk(id)));   -- denied at CREATE TABLE (MEDIUM > LOW)
+RESET ROLE;
+SET ROLE mic_low_user;
 CREATE TABLE r_chk_med (id int CHECK (public.low_sql_chk(id)));
-INSERT INTO r_chk_med VALUES (1);
+GRANT INSERT ON r_chk_med TO mic_medium_user;
+RESET ROLE;
+SET ROLE mic_medium_user;
+INSERT INTO r_chk_med VALUES (1);      -- denied: write-down is fine, the LOW CHECK code is not
 RESET ROLE;
 
 -- ============================================================
@@ -285,12 +300,14 @@ CREATE TRIGGER t_when BEFORE INSERT ON r_trg_when
 SET ROLE mic_low_user;
 CREATE FUNCTION public.low_def() RETURNS int AS 'BEGIN RETURN 7; END' LANGUAGE plpgsql VOLATILE;
 CREATE FUNCTION public.low_gen(int) RETURNS int AS 'SELECT $1 * 2' LANGUAGE sql IMMUTABLE;
+-- (defined by the LOW user; the HIGH subject's INSERT is write-down, and it
+-- is the LOW default / generation code that must not run)
+CREATE TABLE r_def (id int DEFAULT public.low_def());
+CREATE TABLE r_gs (id int, g int GENERATED ALWAYS AS (public.low_gen(id)) STORED);
 RESET ROLE;
 -- DEFAULT reaches a LOW function on INSERT
-CREATE TABLE r_def (id int DEFAULT public.low_def());
 INSERT INTO r_def DEFAULT VALUES;
 -- STORED generated column reaches a LOW function on write
-CREATE TABLE r_gs (id int, g int GENERATED ALWAYS AS (public.low_gen(id)) STORED);
 INSERT INTO r_gs (id) VALUES (1);
 -- VIRTUAL generated columns exist only on PG18+; silent no-op elsewhere
 SELECT current_setting('server_version_num')::int >= 180000 AS pg18plus \gset
@@ -335,8 +352,8 @@ SET ROLE mic_low_user;
 CREATE FUNCTION public.low_domchk(int) RETURNS boolean
     AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
 CREATE DOMAIN public.low_dom AS int CHECK (public.low_domchk(VALUE));
-RESET ROLE;
 CREATE TABLE r_dom (id public.low_dom);
+RESET ROLE;
 INSERT INTO r_dom VALUES (1);          -- denied: domain CHECK reaches LOW fn
 
 -- ============================================================
@@ -347,8 +364,8 @@ SET ROLE mic_low_user;
 CREATE FUNCTION public.low_domchk2(int) RETURNS boolean
     AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
 CREATE DOMAIN public.low_dom2 AS int CHECK (public.low_domchk2(VALUE));
-RESET ROLE;
 CREATE TABLE r_domcast (x int CHECK ((x::public.low_dom2) >= 0));
+RESET ROLE;
 INSERT INTO r_domcast VALUES (1);      -- denied: cast-to-domain CHECK reaches LOW fn
 
 -- ============================================================
@@ -369,14 +386,14 @@ CREATE DOMAIN public.low_rsub AS int CHECK (public.low_ndchk(VALUE));
 CREATE TYPE public.low_rng AS RANGE (subtype = public.low_rsub);
 -- composite type with a domain field
 CREATE TYPE public.low_comp AS (a public.low_elem);
-RESET ROLE;
 CREATE TABLE r_nd (v public.low_outer);
-INSERT INTO r_nd VALUES (1);           -- denied: nested domain CHECK reaches LOW fn
 CREATE TABLE r_ad (v public.low_elem[]);
-INSERT INTO r_ad VALUES ('{1}');       -- denied: array element domain CHECK reaches LOW fn
 CREATE TABLE r_rd (v public.low_rng);
-INSERT INTO r_rd VALUES ('[1,2]');     -- denied: range subtype domain CHECK reaches LOW fn
 CREATE TABLE r_cd (v public.low_comp);
+RESET ROLE;
+INSERT INTO r_nd VALUES (1);           -- denied: nested domain CHECK reaches LOW fn
+INSERT INTO r_ad VALUES ('{1}');       -- denied: array element domain CHECK reaches LOW fn
+INSERT INTO r_rd VALUES ('[1,2]');     -- denied: range subtype domain CHECK reaches LOW fn
 INSERT INTO r_cd VALUES (ROW(1));      -- denied: composite field domain CHECK reaches LOW fn
 
 -- ============================================================
@@ -388,11 +405,14 @@ CREATE FUNCTION public.low_rls(int) RETURNS boolean
 RESET ROLE;
 CREATE TABLE r_rls (id int);
 ALTER TABLE r_rls ENABLE ROW LEVEL SECURITY;
-CREATE POLICY p_sel ON r_rls FOR SELECT USING (public.low_rls(id));
+-- a HIGH subject may not define a policy in terms of a LOW function ...
+CREATE POLICY p_sel ON r_rls FOR SELECT USING (public.low_rls(id));   -- denied at CREATE POLICY
+-- ... so the policies use a HIGH helper that is demoted afterwards
+CREATE FUNCTION public.high_rls(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql STABLE;
+CREATE POLICY p_sel ON r_rls FOR SELECT USING (public.high_rls(id));
 INSERT INTO r_rls VALUES (1);
 ALTER TABLE r_rls FORCE ROW LEVEL SECURITY;
-SELECT count(*) FROM r_rls;            -- denied: USING qual reaches LOW fn
-
 -- primary rd_rsdesc path: non-superuser HIGH subject genuinely subject to RLS
 CREATE ROLE mic_rls_high LOGIN;
 SELECT mic_set_role_level('mic_rls_high', 'high');
@@ -400,8 +420,11 @@ CREATE TABLE r_rls_pri (id int);
 INSERT INTO r_rls_pri VALUES (1);
 ALTER TABLE r_rls_pri ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p_pri ON r_rls_pri FOR ALL TO mic_rls_high
-    USING (public.low_rls(id)) WITH CHECK (public.low_rls(id));
+    USING (public.high_rls(id)) WITH CHECK (public.high_rls(id));
 GRANT SELECT, INSERT ON r_rls_pri TO mic_rls_high;
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.high_rls(int)'::regprocedure::oid, 'low');
+SELECT count(*) FROM r_rls;            -- denied: USING qual reaches LOW fn
 SET ROLE mic_rls_high;
 SELECT count(*) FROM r_rls_pri;        -- denied: USING policy reaches LOW fn
 INSERT INTO r_rls_pri VALUES (2);      -- denied: WITH CHECK policy reaches LOW fn
@@ -424,8 +447,8 @@ CREATE FUNCTION public.low_copychk(int) RETURNS boolean
     AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
 CREATE FUNCTION public.low_trunc() RETURNS trigger
     AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
-RESET ROLE;
 CREATE TABLE r_copy (id int CHECK (public.low_copychk(id)));
+RESET ROLE;
 COPY r_copy FROM STDIN;
 1
 \.
@@ -522,6 +545,37 @@ ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.nosuchfn(1);
 \set VERBOSITY default
 
 -- ============================================================
+-- Definition-time refusal: a HIGH subject cannot define an object in terms
+-- of a LOW function, nor derive one from a LOW relation
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_defn(int) RETURNS int
+    AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE FUNCTION public.low_defn_chk(int) RETURNS boolean
+    AS 'BEGIN RETURN true; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE DOMAIN public.low_defn_dom AS int CHECK (public.low_defn_chk(VALUE));
+CREATE TABLE r_defn_src (id int DEFAULT public.low_defn(1));
+CREATE TABLE r_defn_par (id int) PARTITION BY RANGE (id);
+CREATE TABLE r_defn_orphan (id int);
+RESET ROLE;
+CREATE TABLE r_defn (id int DEFAULT public.low_defn(1));                   -- denied: default
+CREATE TABLE r_defn (id int CHECK (public.low_defn_chk(id)));              -- denied: column CHECK
+CREATE TABLE r_defn (id int, CHECK (public.low_defn_chk(id)));             -- denied: table CHECK
+CREATE TABLE r_defn (id int, g int GENERATED ALWAYS AS (public.low_defn(id)) STORED);  -- denied: generated
+CREATE TABLE r_defn (id public.low_defn_dom);                              -- denied: LOW-checked domain column
+CREATE TABLE r_defn (id int) PARTITION BY RANGE (public.low_defn(id));     -- denied: partition key
+CREATE TABLE r_defn (LIKE r_defn_src INCLUDING DEFAULTS);                  -- denied: LIKE a LOW relation
+CREATE TABLE r_defn (id int) INHERITS (r_defn_src);                        -- denied: INHERITS a LOW parent
+CREATE TABLE r_defn PARTITION OF r_defn_par FOR VALUES FROM (0) TO (10);   -- denied: PARTITION OF a LOW parent
+CREATE TABLE r_defn (id int);                                              -- allowed: nothing LOW involved
+ALTER TABLE r_defn INHERIT r_defn_src;                                     -- denied: INHERIT a LOW parent
+CREATE TABLE r_defn_hipar (id int) PARTITION BY RANGE (id);
+ALTER TABLE r_defn_hipar ATTACH PARTITION r_defn_orphan FOR VALUES FROM (0) TO (10);  -- denied: ATTACH a LOW relation
+CREATE DOMAIN public.hi_defn_dom AS int CHECK (public.low_defn_chk(VALUE));          -- denied: CREATE DOMAIN
+CREATE DOMAIN public.hi_defn_dom AS int;
+ALTER DOMAIN public.hi_defn_dom ADD CHECK (public.low_defn_chk(VALUE));             -- denied: ALTER DOMAIN
+
+-- ============================================================
 -- Function-manager backstop: call sites the executor never sees
 -- ============================================================
 -- event trigger: a HIGH subject may not attach a LOW function ...
@@ -611,6 +665,15 @@ RESET ROLE;
 SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
 
 -- Cleanup
+DROP DOMAIN public.hi_defn_dom;
+DROP TABLE r_defn_hipar;
+DROP TABLE r_defn;
+DROP TABLE r_defn_orphan;
+DROP TABLE r_defn_par;
+DROP TABLE r_defn_src;
+DROP DOMAIN public.low_defn_dom;
+DROP FUNCTION public.low_defn_chk(int);
+DROP FUNCTION public.low_defn(int);
 DROP FUNCTION public.high_sqlf(int);
 DROP TABLE r_stat;
 DROP MATERIALIZED VIEW r_mv;
@@ -646,6 +709,7 @@ DROP TABLE r_rls_pri;
 DROP ROLE mic_rls_high;
 DROP TABLE r_rls;
 DROP FUNCTION public.low_rls(int);
+DROP FUNCTION public.high_rls(int);
 DROP TABLE r_domcast;
 DROP DOMAIN public.low_dom2;
 DROP FUNCTION public.low_domchk2(int);
@@ -689,6 +753,7 @@ DROP TABLE r_chk_low;
 DROP TABLE r_chk_med;
 DROP FUNCTION public.low_sql_chk(int);
 DROP FUNCTION public.high_chk(int);
+DROP FUNCTION public.high_chk2(int);
 DROP TABLE mic_test_high;
 DROP TABLE mic_test_medium;
 DROP TABLE mic_test_low;

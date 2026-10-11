@@ -85,6 +85,8 @@ extern void mic_check_expr_functions(Node *expr, int subject_level,
 extern void mic_check_one_function(Oid funcid, int subject_level,
 									const char *via, const char *objname);
 extern void mic_check_function_call(Oid funcid);
+extern void mic_check_column_type(Oid typid, int subject_level,
+								  const char *objname);
 
 /*
  * promote.c -- SQL-callable functions declared via PG_FUNCTION_INFO_V1

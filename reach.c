@@ -616,6 +616,13 @@ check_domain_of_type(Oid typid, int subject_level, const char *relname)
 		check_domain_of_type(get_multirange_range(typid), subject_level, relname);
 }
 
+/* Definition-time entry point: vet a column type's domain chain. */
+void
+mic_check_column_type(Oid typid, int subject_level, const char *objname)
+{
+	check_domain_of_type(typid, subject_level, objname);
+}
+
 static void
 check_domain_checks(Relation rel, int subject_level)
 {

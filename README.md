@@ -91,10 +91,17 @@ Statically covered attachment points:
   reached through a field of a composite type
 - a materialized view's query, on `REFRESH`
 
-Pre-checked at definition time, so a HIGH subject cannot even attach a lower
-function to an object: `CREATE TRIGGER` (function and `WHEN` clause), `CREATE
-EVENT TRIGGER`, `CREATE STATISTICS`, `CREATE INDEX`, and the `ALTER TABLE`
-subcommands that add constraints, defaults, indexes, or expressions.
+Pre-checked at definition time, so a HIGH subject cannot even define an
+object in terms of a lower function, or derive one from a lower relation:
+`CREATE TABLE` (column defaults, CHECK/EXCLUDE constraints, generated
+columns, the partition key, a column whose domain CHECKs reach a lower
+function, and anything adopted via `LIKE`, `INHERITS`, `PARTITION OF`, or
+`OF type`), `ALTER TABLE` (add constraint/default/index/expression, `ATTACH
+PARTITION`, `INHERIT`), `CREATE TRIGGER` (function and `WHEN` clause),
+`CREATE EVENT TRIGGER`, `CREATE`/`ALTER POLICY`, `CREATE`/`ALTER DOMAIN`,
+`CREATE STATISTICS`, and `CREATE INDEX`. Deriving from a lower relation
+(`LIKE`, `INHERITS`, `PARTITION OF`, `ATTACH`, `INHERIT`) is a read of that
+relation and is refused as read-down.
 
 Built-in functions (OID < 16384) are exempt, so ordinary SQL works for all
 users. The utility path covers COPY, TRUNCATE, CREATE INDEX, REINDEX (including
@@ -307,7 +314,10 @@ RESET ROLE;
 ## Supported Versions
 
 PostgreSQL 14 through master. Validated on 14, 15, 16, 17, 18, 19, and
-master; version differences are handled with guards in `pg_mic_compat.h`.
+master -- the regression suite on all seven, and the TAP suite (including the
+two-node logical-replication test) on every branch built with
+`--enable-tap-tests`; the stable branches are tested with `--enable-cassert`.
+Version differences are handled with guards in `pg_mic_compat.h`.
 
 ## Limitations and Non-Escapes
 
