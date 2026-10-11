@@ -35,6 +35,7 @@ typedef struct MicPermEntry
 {
 	Oid			relid;
 	AclMode		requiredPerms;
+	bool		inh;			/* statement reaches inheritance children */
 } MicPermEntry;
 
 /*
@@ -55,6 +56,13 @@ typedef struct MicPermEntry
 	mic_perm_entries((rangeTabls), NIL)
 #define MIC_CALL_NEXT_CHECKPERMS(next, rangeTabls, rteperminfos, abort) \
 	(*(next)) ((rangeTabls), (abort))
+#endif
+
+/* MarkGUCPrefixReserved() replaced EmitWarningsOnPlaceholders() in PG15. */
+#if PG_VERSION_NUM >= 150000
+#define MIC_MARK_GUC_PREFIX_RESERVED(prefix) MarkGUCPrefixReserved(prefix)
+#else
+#define MIC_MARK_GUC_PREFIX_RESERVED(prefix) EmitWarningsOnPlaceholders(prefix)
 #endif
 
 /*

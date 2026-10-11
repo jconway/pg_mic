@@ -57,6 +57,7 @@ extern int	mic_get_subject_level(void);
 extern int	mic_get_object_level(Oid classId, Oid objectId);
 extern void mic_object_relabel(const ObjectAddress *object,
 								const char *seclabel);
+extern void mic_set_label(const ObjectAddress *object, const char *label);
 
 /*
  * enforce.c
@@ -77,10 +78,13 @@ extern void mic_check_reachable_functions(Oid relid, AclMode required_ops);
 extern void mic_check_truncate_triggers(List *relids, bool cascade);
 extern void mic_check_reindex_exprs(Oid relid, bool is_index);
 extern void mic_check_reindex_relations(Oid nspoid);
+extern void mic_check_matview_refresh(Oid relid);
+extern List *mic_relation_tree(Oid relid, bool inh);
 extern void mic_check_expr_functions(Node *expr, int subject_level,
 									  const char *via, const char *objname);
 extern void mic_check_one_function(Oid funcid, int subject_level,
 									const char *via, const char *objname);
+extern void mic_check_function_call(Oid funcid);
 
 /*
  * promote.c -- SQL-callable functions declared via PG_FUNCTION_INFO_V1

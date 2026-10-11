@@ -11,12 +11,57 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_proc.h"
 #include "commands/seclabel.h"
 #include "miscadmin.h"
 #include "pg_mic.h"
 #include "utils/builtins.h"
+#include "utils/syscache.h"
+
+/*
+ * Whether a function needs the function-manager hook is decided from its
+ * label when its FmgrInfo is built, and the planner declines to inline any
+ * function that needs it.  A function labeled HIGH needs no hook (no subject
+ * can be above it), so HIGH SQL functions inline normally.  Relabeling a
+ * function must therefore invalidate every cached plan that depends on it,
+ * or a plan built while it was HIGH would keep calling (or keep an inlined
+ * copy of) a function that has since been demoted.  A security label change
+ * touches only pg_seclabel, which no cache watches, so rewrite the pg_proc
+ * row in place: that broadcasts the PROCOID invalidation the plan cache
+ * listens for.
+ */
+static void
+mic_invalidate_function(Oid funcid)
+{
+	Relation	rel;
+	HeapTuple	tup;
+
+	rel = table_open(ProcedureRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(funcid));
+	if (HeapTupleIsValid(tup))
+	{
+		CatalogTupleUpdate(rel, &tup->t_self, tup);
+		heap_freetuple(tup);
+	}
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Set an integrity label.  All of the extension's own relabeling goes
+ * through here so that function relabels invalidate dependent plans.
+ */
+void
+mic_set_label(const ObjectAddress *object, const char *label)
+{
+	if (object->classId == ProcedureRelationId && object->objectSubId == 0)
+		mic_invalidate_function(object->objectId);
+	SetSecurityLabel(object, MIC_LABEL_TAG, label);
+}
 
 /*
  * Convert a string label to an integrity level value.
@@ -151,4 +196,8 @@ mic_object_relabel(const ObjectAddress *object, const char *seclabel)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("pg_mic: only superuser can set integrity labels")));
+
+	/* SECURITY LABEL ... ON FUNCTION: the label is applied by the caller */
+	if (object->classId == ProcedureRelationId && object->objectSubId == 0)
+		mic_invalidate_function(object->objectId);
 }

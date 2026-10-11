@@ -344,29 +344,68 @@ CREATE FUNCTION public.low_trig() RETURNS trigger
     AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
 CREATE FUNCTION public.low_trig_del() RETURNS trigger
     AS 'BEGIN RETURN OLD; END' LANGUAGE plpgsql;
-RESET ROLE;
+-- (the LOW user owns the table and plants the triggers; the HIGH subject's
+-- writes into the LOW table are write-down, which Biba permits -- the LOW
+-- trigger code is what must not run)
 CREATE TABLE r_trg (id int);
 CREATE TRIGGER t_ins BEFORE INSERT ON r_trg
     FOR EACH ROW EXECUTE FUNCTION public.low_trig();
 CREATE TRIGGER t_del BEFORE DELETE ON r_trg
     FOR EACH ROW EXECUTE FUNCTION public.low_trig_del();
+RESET ROLE;
+-- a HIGH subject may not wire a LOW function into a table at all
+CREATE TABLE r_trg_hi (id int);
+CREATE TRIGGER t_hi BEFORE INSERT ON r_trg_hi
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig();    -- denied at CREATE TRIGGER
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig" reached via CREATE TRIGGER on "r_trg_hi"
 -- INSERT denied (LOW insert trigger)
 INSERT INTO r_trg VALUES (1);
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig" reached via trigger on "r_trg"
 -- event filtering: DELETE must NOT be blocked by the INSERT trigger,
 -- but IS blocked by the LOW delete trigger
-DELETE FROM r_trg WHERE id = 1;
+DELETE FROM r_trg;
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig_del" reached via trigger on "r_trg"
 -- event filtering proof: table with ONLY a LOW insert trigger; a HIGH
 -- DELETE must SUCCEED (insert trigger not consulted for DELETE)
 SET ROLE mic_low_user;
 CREATE FUNCTION public.low_trig_ins_only() RETURNS trigger
     AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
-RESET ROLE;
 CREATE TABLE r_trg_insonly (id int);
 CREATE TRIGGER t_ins_only BEFORE INSERT ON r_trg_insonly
     FOR EACH ROW EXECUTE FUNCTION public.low_trig_ins_only();
-DELETE FROM r_trg_insonly WHERE id = 0;
+RESET ROLE;
+DELETE FROM r_trg_insonly;
+-- triggers on partitions and inheritance children fire for DML on the
+-- parent, which is all the statement names
+SET ROLE mic_low_user;
+CREATE TABLE r_trg_par (id int) PARTITION BY RANGE (id);
+CREATE TABLE r_trg_par_p1 PARTITION OF r_trg_par FOR VALUES FROM (0) TO (100);
+CREATE TRIGGER t_p1 BEFORE INSERT ON r_trg_par_p1
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig();
+CREATE TABLE r_trg_inh (id int);
+CREATE TABLE r_trg_inh_c (id int) INHERITS (r_trg_inh);
+NOTICE:  merging column "id" with inherited definition
+CREATE TRIGGER t_c BEFORE DELETE ON r_trg_inh_c
+    FOR EACH ROW EXECUTE FUNCTION public.low_trig_del();
+RESET ROLE;
+INSERT INTO r_trg_par VALUES (1);      -- denied: routed into partition with LOW trigger
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig" reached via trigger on "r_trg_par_p1"
+COPY r_trg_par FROM STDIN;
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig" reached via trigger on "r_trg_par_p1"
+DELETE FROM r_trg_inh;                 -- denied: child's LOW delete trigger
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trig_del" reached via trigger on "r_trg_inh_c"
+DELETE FROM ONLY r_trg_inh;            -- allowed: ONLY does not reach the child
+-- the WHEN clause of a trigger runs even before its function does
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_when(int) RETURNS boolean
+    AS 'BEGIN RETURN true; END' LANGUAGE plpgsql;
+RESET ROLE;
+CREATE FUNCTION public.high_noop_trig() RETURNS trigger
+    AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+CREATE TABLE r_trg_when (id int);
+CREATE TRIGGER t_when BEFORE INSERT ON r_trg_when
+    FOR EACH ROW WHEN (public.low_when(NEW.id)) EXECUTE FUNCTION public.high_noop_trig();  -- denied at CREATE TRIGGER
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_when" reached via CREATE TRIGGER on "r_trg_when"
 -- ============================================================
 -- Reachable-function enforcement: defaults and generated columns
 -- ============================================================
@@ -475,10 +514,14 @@ INSERT INTO r_nd VALUES (1);           -- denied: nested domain CHECK reaches LO
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk" reached via domain CHECK on "r_nd"
 CREATE TABLE r_ad (v public.low_elem[]);
 INSERT INTO r_ad VALUES ('{1}');       -- denied: array element domain CHECK reaches LOW fn
-ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk" reached via domain CHECK on "r_ad"
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk"
+LINE 1: INSERT INTO r_ad VALUES ('{1}');
+                                 ^
 CREATE TABLE r_rd (v public.low_rng);
 INSERT INTO r_rd VALUES ('[1,2]');     -- denied: range subtype domain CHECK reaches LOW fn
-ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk" reached via domain CHECK on "r_rd"
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk"
+LINE 1: INSERT INTO r_rd VALUES ('[1,2]');
+                                 ^
 CREATE TABLE r_cd (v public.low_comp);
 INSERT INTO r_cd VALUES (ROW(1));      -- denied: composite field domain CHECK reaches LOW fn
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ndchk" reached via domain CHECK on "r_cd"
@@ -542,9 +585,13 @@ RESET ROLE;
 CREATE TABLE r_copy (id int CHECK (public.low_copychk(id)));
 COPY r_copy FROM STDIN;
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_copychk" reached via CHECK constraint on "r_copy"
+-- (LOW-owned tables with LOW-planted TRUNCATE triggers; TRUNCATE by the HIGH
+-- subject is write-down and otherwise permitted)
+SET ROLE mic_low_user;
 CREATE TABLE r_trunc (id int);
 CREATE TRIGGER t_tr BEFORE TRUNCATE ON r_trunc
     FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc();
+RESET ROLE;
 TRUNCATE r_trunc;                      -- denied: LOW truncate trigger
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc" reached via truncate trigger on "r_trunc"
 -- TRUNCATE reaches triggers on partitions, inheritance children, and
@@ -552,28 +599,28 @@ ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integ
 SET ROLE mic_low_user;
 CREATE FUNCTION public.low_trunc2() RETURNS trigger
     AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
-RESET ROLE;
 -- partition: trigger on the partition, TRUNCATE the partitioned parent
 CREATE TABLE r_tpar (id int) PARTITION BY RANGE (id);
 CREATE TABLE r_tpar_p1 PARTITION OF r_tpar FOR VALUES FROM (0) TO (100);
 CREATE TRIGGER t_tp BEFORE TRUNCATE ON r_tpar_p1
     FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
-TRUNCATE r_tpar;                       -- denied: partition's LOW truncate trigger
-ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc2" reached via truncate trigger on "r_tpar_p1"
 -- inheritance child: trigger on the child, TRUNCATE the parent
 CREATE TABLE r_tparent (id int);
 CREATE TABLE r_tchild (id int) INHERITS (r_tparent);
 NOTICE:  merging column "id" with inherited definition
 CREATE TRIGGER t_tc BEFORE TRUNCATE ON r_tchild
     FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
-TRUNCATE r_tparent;                    -- denied: child's LOW truncate trigger
-ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc2" reached via truncate trigger on "r_tchild"
-TRUNCATE ONLY r_tparent;               -- allowed: ONLY does not reach the child
 -- CASCADE: the FK-referencing table carries the LOW truncate trigger
 CREATE TABLE r_tref (id int PRIMARY KEY);
 CREATE TABLE r_tdep (id int REFERENCES r_tref(id));
 CREATE TRIGGER t_td BEFORE TRUNCATE ON r_tdep
     FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
+RESET ROLE;
+TRUNCATE r_tpar;                       -- denied: partition's LOW truncate trigger
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc2" reached via truncate trigger on "r_tpar_p1"
+TRUNCATE r_tparent;                    -- denied: child's LOW truncate trigger
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc2" reached via truncate trigger on "r_tchild"
+TRUNCATE ONLY r_tparent;               -- allowed: ONLY does not reach the child
 TRUNCATE r_tref CASCADE;               -- denied: FK-cascade reaches r_tdep's LOW trigger
 ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_trunc2" reached via truncate trigger on "r_tdep"
 -- ============================================================
@@ -640,6 +687,93 @@ ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.nosuchfn(1);
 ERROR:  function public.nosuchfn(integer) does not exist
 \set VERBOSITY default
 -- ============================================================
+-- Function-manager backstop: call sites the executor never sees
+-- ============================================================
+-- event trigger: a HIGH subject may not attach a LOW function ...
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_evt() RETURNS event_trigger
+    AS 'BEGIN END' LANGUAGE plpgsql;
+RESET ROLE;
+CREATE EVENT TRIGGER mic_evt ON ddl_command_end EXECUTE FUNCTION public.low_evt();  -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_evt" reached via CREATE EVENT TRIGGER "mic_evt"
+-- ... and an event trigger whose function is demoted afterwards is denied
+-- when it fires (event_trigger.c calls the function manager directly)
+CREATE FUNCTION public.high_evt() RETURNS event_trigger
+    AS 'BEGIN END' LANGUAGE plpgsql;
+CREATE EVENT TRIGGER mic_evt ON ddl_command_end EXECUTE FUNCTION public.high_evt();
+CREATE TABLE r_evt_ok (id int);        -- allowed: HIGH event trigger function
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.high_evt()'::regprocedure::oid, 'low');
+ mic_promote_object 
+--------------------
+ 
+(1 row)
+
+CREATE TABLE r_evt_bad (id int);       -- denied: event trigger function is now LOW
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "high_evt"
+DROP EVENT TRIGGER mic_evt;
+-- range subtype_diff: reached only through the type cache (GiST penalty,
+-- selectivity estimation), never through an executor expression
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_diff(a int, b int) RETURNS float8
+    AS 'BEGIN RETURN (a - b)::float8; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE TYPE public.low_drng AS RANGE (subtype = int, subtype_diff = public.low_diff);
+RESET ROLE;
+CREATE TABLE r_rng (r public.low_drng);
+CREATE INDEX r_rng_gist ON r_rng USING gist (r);
+INSERT INTO r_rng
+  SELECT format('[%s,%s)', g, g + 5)::public.low_drng
+    FROM generate_series(1, 300) g;    -- denied: GiST penalty calls the LOW subtype_diff
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_diff"
+-- maintenance commands switch to the table owner's identity before running
+-- index / statistics / view code; like REINDEX they are checked against the
+-- invoking subject first
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_mix(int) RETURNS int
+    AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE r_maint (id int);
+INSERT INTO r_maint VALUES (1);
+CREATE INDEX r_maint_ix ON r_maint (public.low_mix(id));
+CREATE FUNCTION public.low_mvf() RETURNS int
+    AS 'BEGIN RETURN 1; END' LANGUAGE plpgsql;
+CREATE MATERIALIZED VIEW r_mv AS SELECT public.low_mvf() AS v;
+RESET ROLE;
+VACUUM r_maint;                        -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mix" reached via index expression on "r_maint"
+ANALYZE r_maint;                       -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mix" reached via index expression on "r_maint"
+VACUUM FULL r_maint;                   -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mix" reached via index expression on "r_maint"
+CLUSTER r_maint USING r_maint_ix;      -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mix" reached via index expression on "r_maint"
+REFRESH MATERIALIZED VIEW r_mv;        -- denied: LOW function in the view query
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mvf" reached via query of materialized view "r_mv"
+-- statistics expressions run at every ANALYZE, autovacuum's included
+CREATE TABLE r_stat (id int);
+CREATE STATISTICS r_stat_x ON (public.low_mix(id)) FROM r_stat;   -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_mix" reached via CREATE STATISTICS expression for "statistics object"
+-- a cached plan is invalidated when a function is demoted: the first
+-- EXECUTE inlines the HIGH SQL function, the second must see it as LOW
+CREATE FUNCTION public.high_sqlf(int) RETURNS int
+    AS 'SELECT $1 + 1' LANGUAGE sql IMMUTABLE;
+PREPARE mic_pp AS SELECT public.high_sqlf(1);
+EXECUTE mic_pp;                        -- allowed (and inlined)
+ high_sqlf 
+-----------
+         2
+(1 row)
+
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.high_sqlf(int)'::regprocedure::oid, 'low');
+ mic_promote_object 
+--------------------
+ 
+(1 row)
+
+EXECUTE mic_pp;                        -- denied: plan rebuilt, function now LOW
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "high_sqlf"
+DEALLOCATE mic_pp;
+-- ============================================================
 -- Bulk extension promotion
 -- ============================================================
 BEGIN;
@@ -690,6 +824,18 @@ SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
 ERROR:  pg_mic: "bogus" is not a valid integrity level
 HINT:  Valid levels are: low, medium, high.
 -- Cleanup
+DROP FUNCTION public.high_sqlf(int);
+DROP TABLE r_stat;
+DROP MATERIALIZED VIEW r_mv;
+DROP FUNCTION public.low_mvf();
+DROP TABLE r_maint;
+DROP FUNCTION public.low_mix(int);
+DROP TABLE r_rng;
+DROP TYPE public.low_drng;
+DROP FUNCTION public.low_diff(int, int);
+DROP TABLE r_evt_ok;
+DROP FUNCTION public.high_evt();
+DROP FUNCTION public.low_evt();
 DROP TABLE r_at;
 DROP FUNCTION public.low_atchk(int);
 -- ============================================================
@@ -743,6 +889,13 @@ DROP TABLE r_gs;
 DROP FUNCTION public.low_def();
 DROP FUNCTION public.low_gen(int);
 DROP TABLE r_trg;
+DROP TABLE r_trg_hi;
+DROP TABLE r_trg_par;
+DROP TABLE r_trg_inh CASCADE;
+NOTICE:  drop cascades to table r_trg_inh_c
+DROP TABLE r_trg_when;
+DROP FUNCTION public.high_noop_trig();
+DROP FUNCTION public.low_when(int);
 DROP TABLE r_trg_insonly;
 DROP FUNCTION public.low_trig_ins_only();
 DROP FUNCTION public.low_trig();

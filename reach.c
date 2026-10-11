@@ -38,6 +38,7 @@
 #include "nodes/nodes.h"
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rowsecurity.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -309,6 +310,50 @@ mic_check_one_function(Oid funcid, int subject_level,
 	}
 }
 
+/*
+ * Function-manager entry check: the subject about to execute funcid, in
+ * whatever identity the call runs, must not be above it.  This is invoked
+ * for every call of every user-defined function (see mic_fmgr_hook), so it
+ * is the authoritative guard for call sites the executor hooks never see.
+ */
+void
+mic_check_function_call(Oid funcid)
+{
+	int			subject_level;
+	int			objlevel;
+	char	   *fname;
+
+	if (!OidIsValid(funcid) || funcid < MIC_SYSTEM_OID_THRESHOLD)
+		return;					/* built-in / system: exempt */
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;					/* nothing is below LOW */
+
+	objlevel = mic_get_object_level(ProcedureRelationId, funcid);
+	if (objlevel >= subject_level)
+		return;
+
+	fname = get_func_name(funcid);
+	if (fname == NULL)
+		fname = "(unknown)";
+	if (mic_debug_audit)
+		ereport(LOG,
+				(errmsg("pg_mic: execute denied - subject %s > function %s \"%s\" (func %u) at function manager entry",
+						mic_level_to_string(subject_level),
+						mic_level_to_string(objlevel), fname, funcid)));
+	if (mic_is_enforcing())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_mic: execute denied - %s integrity subject cannot execute %s integrity function \"%s\"",
+						mic_level_to_string(subject_level),
+						mic_level_to_string(objlevel), fname)));
+	else
+		ereport(WARNING,
+				(errmsg("pg_mic: execute violation (permissive) of function \"%s\"",
+						fname)));
+}
+
 void
 mic_check_expr_functions(Node *expr, int subject_level,
 						 const char *via, const char *objname)
@@ -378,6 +423,11 @@ check_triggers(Relation rel, int subject_level, AclMode required_ops)
 			continue;
 		mic_check_one_function(tg->tgfoid, subject_level,
 							   "trigger on", RelationGetRelationName(rel));
+		/* the WHEN clause is evaluated before the function is even called */
+		if (tg->tgqual != NULL)
+			mic_check_expr_functions(stringToNode(tg->tgqual), subject_level,
+									 "trigger WHEN clause on",
+									 RelationGetRelationName(rel));
 	}
 }
 
@@ -888,6 +938,64 @@ mic_check_reindex_exprs(Oid relid, bool is_index)
 	rel = try_table_open(relid, AccessShareLock);
 	if (rel == NULL)
 		return;
+	check_index_exprs(rel, subject_level);
+	table_close(rel, AccessShareLock);
+}
+
+/*
+ * The relations a statement naming relid actually touches: relid itself plus,
+ * when the statement recurses (inh, i.e. no ONLY) or relid is a partitioned
+ * table (every DML path routes into or scans the partitions regardless of
+ * ONLY), its whole inheritance/partition tree.  Each descendant is locked
+ * with AccessShareLock, as find_all_inheritors requires.
+ */
+List *
+mic_relation_tree(Oid relid, bool inh)
+{
+	if (inh || get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+		return find_all_inheritors(relid, AccessShareLock, NULL);
+	return list_make1_oid(relid);
+}
+
+/*
+ * REFRESH MATERIALIZED VIEW re-runs the view's stored query, and rebuilds its
+ * indexes, under the view owner's identity -- so, like REINDEX, the invoking
+ * subject must be checked against every function in that query and in those
+ * index expressions before the owner switch happens.
+ */
+void
+mic_check_matview_refresh(Oid relid)
+{
+	int			subject_level;
+	Relation	rel;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+
+	/*
+	 * A materialized view's defining query is the action of its single
+	 * ON SELECT rule, which is how ExecRefreshMatView itself fetches it
+	 * (get_view_query() is for plain views only).
+	 */
+	if (rel->rd_rel->relkind == RELKIND_MATVIEW &&
+		rel->rd_rules != NULL && rel->rd_rules->numLocks == 1 &&
+		rel->rd_rules->rules[0]->event == CMD_SELECT &&
+		list_length(rel->rd_rules->rules[0]->actions) == 1)
+		mic_check_expr_functions(linitial(rel->rd_rules->rules[0]->actions),
+								 subject_level,
+								 "query of materialized view",
+								 RelationGetRelationName(rel));
 	check_index_exprs(rel, subject_level);
 	table_close(rel, AccessShareLock);
 }

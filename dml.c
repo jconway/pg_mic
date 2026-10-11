@@ -44,6 +44,7 @@ mic_perm_entries(List *rangeTabls, List *rteperminfos)
 
 		e->relid = pi->relid;
 		e->requiredPerms = pi->requiredPerms;
+		e->inh = pi->inh;
 		out = lappend(out, e);
 	}
 #else
@@ -58,10 +59,58 @@ mic_perm_entries(List *rangeTabls, List *rteperminfos)
 		e = palloc(sizeof(MicPermEntry));
 		e->relid = rte->relid;
 		e->requiredPerms = rte->requiredPerms;
+		e->inh = rte->inh;
 		out = lappend(out, e);
 	}
 #endif
 	return out;
+}
+
+/*
+ * Apply the object-level Biba rules and the reachable-function check to one
+ * relation.  Callers have already decided need_read / need_write.
+ */
+static void
+mic_check_one_relation(Oid relOid, AclMode requiredPerms,
+					   bool need_read, bool need_write)
+{
+	if (IsCatalogRelationOid(relOid) || relOid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	if (need_read && need_write)
+		mic_check_readwrite(RelationRelationId, relOid);
+	else if (need_read)
+		mic_check_read(RelationRelationId, relOid);
+	else
+		mic_check_write(RelationRelationId, relOid);
+	mic_check_reachable_functions(relOid, requiredPerms);
+}
+
+/*
+ * Check a relation and, when the statement reaches them, every relation in
+ * its inheritance/partition tree.  Permission checks are performed on the
+ * parent only (PG16+ records no RTEPermissionInfo for children at all), but
+ * triggers, constraints, defaults and index expressions attached to the
+ * children run just the same -- INSERT routes rows into partitions, and
+ * UPDATE/DELETE/SELECT scan every child -- so the children must be analyzed
+ * too.
+ */
+static void
+mic_check_relation_tree(MicPermEntry *perminfo, bool need_read, bool need_write)
+{
+	List	   *rels;
+	ListCell   *lc;
+
+	/* system relations have no user-defined descendants: nothing to expand */
+	if (IsCatalogRelationOid(perminfo->relid) ||
+		perminfo->relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	rels = mic_relation_tree(perminfo->relid, perminfo->inh);
+	foreach(lc, rels)
+		mic_check_one_relation(lfirst_oid(lc), perminfo->requiredPerms,
+							   need_read, need_write);
+	list_free(rels);
 }
 
 /*
@@ -120,13 +169,7 @@ mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 		{
 			PG_TRY();
 			{
-				if (need_read && need_write)
-					mic_check_readwrite(RelationRelationId, relOid);
-				else if (need_read)
-					mic_check_read(RelationRelationId, relOid);
-				else
-					mic_check_write(RelationRelationId, relOid);
-				mic_check_reachable_functions(relOid, perminfo->requiredPerms);
+				mic_check_relation_tree(perminfo, need_read, need_write);
 			}
 			PG_CATCH();
 			{
@@ -136,15 +179,7 @@ mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 			PG_END_TRY();
 		}
 		else
-		{
-			if (need_read && need_write)
-				mic_check_readwrite(RelationRelationId, relOid);
-			else if (need_read)
-				mic_check_read(RelationRelationId, relOid);
-			else
-				mic_check_write(RelationRelationId, relOid);
-			mic_check_reachable_functions(relOid, perminfo->requiredPerms);
-		}
+			mic_check_relation_tree(perminfo, need_read, need_write);
 	}
 
 	return true;

@@ -28,6 +28,7 @@
 #include "pg_mic_compat.h"
 #include "tcop/utility.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/queryenvironment.h"
 
 MIC_MODULE_MAGIC;
@@ -38,6 +39,8 @@ MIC_MODULE_MAGIC;
 static object_access_hook_type next_object_access_hook = NULL;
 static ExecutorCheckPerms_hook_type next_exec_check_perms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
+static needs_fmgr_hook_type next_needs_fmgr_hook = NULL;
+static fmgr_hook_type next_fmgr_hook = NULL;
 
 /*
  * GUC variables
@@ -92,6 +95,11 @@ mic_object_access(ObjectAccessType access,
 				 * under the Biba model, so each is labeled at creation.
 				 * Skip internal creations (toast tables, indexes from
 				 * ALTER TABLE, etc).
+				 *
+				 * ProcedureCreate fires this hook for CREATE OR REPLACE as
+				 * well, so a function re-defined by a lower-level subject
+				 * is relabeled down to that subject's level: its new body
+				 * is that subject's code.
 				 */
 				if (!is_internal && subId == 0 &&
 					(classId == RelationRelationId ||
@@ -178,8 +186,13 @@ mic_object_access(ObjectAccessType access,
 				 * level of their creator, assigned at OAT_POST_CREATE; the
 				 * extension's own functions are created by a superuser
 				 * during CREATE EXTENSION and are therefore HIGH.
+				 *
+				 * This hook fires from the executor's expression setup, so
+				 * it denies at plan/initialization time.  The function
+				 * manager hook below is the authoritative guard for every
+				 * call site, including those that never go through here.
 				 */
-				mic_check_read(classId, objectId);
+				mic_check_function_call(objectId);
 			}
 			break;
 
@@ -188,6 +201,56 @@ mic_object_access(ObjectAccessType access,
 				 (int) access);
 			break;
 	}
+}
+
+/*
+ * Function-manager hooks: the universal runtime backstop.
+ *
+ * The object-access hook above is only invoked from a handful of executor
+ * sites.  Trigger functions (trigger.c), event triggers, the logical
+ * replication apply path, type support functions such as a range type's
+ * subtype_diff, and anything else PostgreSQL calls through fmgr_info() +
+ * FunctionCallInvoke() never pass through it.  They all do pass through the
+ * function manager, and once needs_fmgr_hook() says a function is of
+ * interest, fmgr routes every one of its invocations through
+ * fmgr_security_definer, which calls fmgr_hook at entry.  Checking the
+ * current subject against the function's level there closes every call
+ * site at once, in whatever identity the call actually executes.
+ *
+ * SQL functions that the planner inlines are never invoked through fmgr, so
+ * they are not seen here; their bodies are expressions whose own function
+ * calls are.  That is precisely the one accepted exception.
+ */
+static bool
+mic_needs_fmgr_hook(Oid fn_oid)
+{
+	if (next_needs_fmgr_hook && (*next_needs_fmgr_hook) (fn_oid))
+		return true;
+
+	/* built-ins are exempt by definition */
+	if (fn_oid < MIC_SYSTEM_OID_THRESHOLD)
+		return false;
+
+	/*
+	 * A function labeled HIGH can be executed by every subject, so it never
+	 * needs checking -- and, because the planner refuses to inline a hooked
+	 * function, leaving HIGH functions unhooked is what keeps HIGH SQL
+	 * functions inlinable.  Everything below HIGH is hooked (and hence not
+	 * inlined): it is denied outright to any higher subject.  This decision
+	 * is independent of mic.mode so that a mode change can never leave a
+	 * stale, unhooked FmgrInfo behind; the hook itself honors the mode.
+	 */
+	return mic_get_object_level(ProcedureRelationId, fn_oid) < MIC_LEVEL_HIGH;
+}
+
+static void
+mic_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
+{
+	if (event == FHET_START && mic_mode != MIC_MODE_DISABLED)
+		mic_check_function_call(flinfo->fn_oid);
+
+	if (next_fmgr_hook)
+		(*next_fmgr_hook) (event, flinfo, private);
 }
 
 /*
@@ -215,10 +278,10 @@ MIC_CHECKPERMS_PROTO(mic_exec_check_perms)
 }
 
 /*
- * Best-effort walk of a raw (unanalyzed) CREATE INDEX expression/predicate:
- * resolve each FuncCall by name and check it against the subject.  Anything
- * that cannot be resolved is silently skipped (never an error); the runtime
- * OAT_FUNCTION_EXECUTE hook remains the authoritative guard during the build.
+ * Best-effort walk of a raw (unanalyzed) expression: resolve each FuncCall
+ * by name and check it against the subject.  Anything that cannot be
+ * resolved is silently skipped (never an error); the runtime hooks remain
+ * the authoritative guard once the command executes.
  */
 typedef struct RawFuncCtx
 {
@@ -249,10 +312,73 @@ mic_raw_func_walker(Node *node, RawFuncCtx *ctx)
 	return raw_expression_tree_walker(node, mic_raw_func_walker, ctx);
 }
 
+/* Resolve a bare function name (CREATE TRIGGER / CREATE EVENT TRIGGER). */
+static void
+mic_check_raw_funcname(List *funcname, RawFuncCtx *ctx)
+{
+#if PG_VERSION_NUM >= 190000
+	int			fgc_flags = 0;
+#endif
+	FuncCandidateList cands = MIC_FUNCNAME_GET_CANDIDATES(funcname);
+
+	if (cands != NULL && cands->next == NULL)
+		mic_check_one_function(cands->oid, ctx->subject_level,
+							   ctx->what, ctx->objname);
+}
+
+/* Walk the expressions and predicate of a raw IndexStmt. */
+static void
+mic_walk_index_stmt(IndexStmt *is, RawFuncCtx *ctx)
+{
+	ListCell   *lc;
+
+	foreach(lc, is->indexParams)
+	{
+		IndexElem  *ie = lfirst_node(IndexElem, lc);
+
+		if (ie->expr)
+			(void) mic_raw_func_walker(ie->expr, ctx);
+	}
+	if (is->whereClause)
+		(void) mic_raw_func_walker(is->whereClause, ctx);
+}
+
+/* Walk every raw expression a table Constraint can carry. */
+static void
+mic_walk_constraint(Constraint *c, RawFuncCtx *ctx)
+{
+	ListCell   *lc;
+
+	(void) mic_raw_func_walker(c->raw_expr, ctx);
+	(void) mic_raw_func_walker(c->where_clause, ctx);
+	foreach(lc, c->exclusions)
+	{
+		List	   *pair = (List *) lfirst(lc);
+		IndexElem  *ie = linitial_node(IndexElem, pair);
+
+		if (ie->expr)
+			(void) mic_raw_func_walker(ie->expr, ctx);
+	}
+}
+
+/* Check the stored index expressions of every relation in a tree. */
+static void
+mic_check_tree_index_exprs(Oid relid, bool inh)
+{
+	List	   *rels = mic_relation_tree(relid, inh);
+	ListCell   *lc;
+
+	foreach(lc, rels)
+		mic_check_reindex_exprs(lfirst_oid(lc), false);
+	list_free(rels);
+}
+
 /*
  * mic_utility_command
  *
- * ProcessUtility_hook callback: block LOAD in enforcing mode.
+ * ProcessUtility_hook callback.  Utility commands that run catalog-stored
+ * code over rows, or that will do so later under another identity, are
+ * checked here against the invoking subject before they execute.
  */
 static void
 mic_utility_command(PlannedStmt *pstmt,
@@ -288,8 +414,17 @@ mic_utility_command(PlannedStmt *pstmt,
 															 true);
 
 						if (OidIsValid(relid))
-							mic_check_reachable_functions(relid,
-														  cs->is_from ? ACL_INSERT : ACL_SELECT);
+						{
+							/* COPY FROM routes into partitions; TO scans children */
+							List	   *rels = mic_relation_tree(relid,
+																cs->relation->inh);
+							ListCell   *lc;
+
+							foreach(lc, rels)
+								mic_check_reachable_functions(lfirst_oid(lc),
+															  cs->is_from ? ACL_INSERT : ACL_SELECT);
+							list_free(rels);
+						}
 					}
 					break;
 				}
@@ -301,20 +436,11 @@ mic_utility_command(PlannedStmt *pstmt,
 					if (lvl > MIC_LEVEL_LOW && is->relation != NULL)
 					{
 						RawFuncCtx	ctx;
-						ListCell   *lc;
 
 						ctx.subject_level = lvl;
 						ctx.objname = is->relation->relname;
 						ctx.what = "index definition on";
-						foreach(lc, is->indexParams)
-						{
-							IndexElem  *ie = lfirst_node(IndexElem, lc);
-
-							if (ie->expr)
-								(void) mic_raw_func_walker(ie->expr, &ctx);
-						}
-						if (is->whereClause)
-							(void) mic_raw_func_walker(is->whereClause, &ctx);
+						mic_walk_index_stmt(is, &ctx);
 					}
 					break;
 				}
@@ -341,6 +467,8 @@ mic_utility_command(PlannedStmt *pstmt,
 							case AT_ColumnDefault:
 							case AT_CookedColumnDefault:
 							case AT_AddIdentity:
+							case AT_AddIndex:
+							case AT_AddIndexConstraint:
 #if PG_VERSION_NUM >= 180000
 							case AT_SetExpression:
 #endif
@@ -355,7 +483,9 @@ mic_utility_command(PlannedStmt *pstmt,
 										ctx.objname = at->relation->relname;
 										ctx.what = "ALTER TABLE on";
 										if (IsA(cmd->def, Constraint))
-											(void) mic_raw_func_walker(((Constraint *) cmd->def)->raw_expr, &ctx);
+											mic_walk_constraint((Constraint *) cmd->def, &ctx);
+										else if (IsA(cmd->def, IndexStmt))
+											mic_walk_index_stmt((IndexStmt *) cmd->def, &ctx);
 										else if (IsA(cmd->def, ColumnDef))
 										{
 											ColumnDef  *cd = (ColumnDef *) cmd->def;
@@ -363,11 +493,7 @@ mic_utility_command(PlannedStmt *pstmt,
 
 											(void) mic_raw_func_walker(cd->raw_default, &ctx);
 											foreach(lc2, cd->constraints)
-											{
-												Constraint *c = lfirst_node(Constraint, lc2);
-
-												(void) mic_raw_func_walker(c->raw_expr, &ctx);
-											}
+												mic_walk_constraint(lfirst_node(Constraint, lc2), &ctx);
 										}
 										else
 										{
@@ -375,8 +501,17 @@ mic_utility_command(PlannedStmt *pstmt,
 											(void) mic_raw_func_walker(cmd->def, &ctx);
 										}
 									}
-									mic_check_reachable_functions(relid,
-																  ACL_INSERT | ACL_UPDATE);
+									/* validation/rewrite runs stored code over the tree */
+									{
+										List	   *rels = mic_relation_tree(relid,
+																			at->relation->inh);
+										ListCell   *lc3;
+
+										foreach(lc3, rels)
+											mic_check_reachable_functions(lfirst_oid(lc3),
+																		  ACL_INSERT | ACL_UPDATE);
+										list_free(rels);
+									}
 								}
 								break;
 							default:
@@ -398,8 +533,12 @@ mic_utility_command(PlannedStmt *pstmt,
 															 true);
 
 						if (OidIsValid(relid))
-							mic_check_reindex_exprs(relid,
-													rs->kind == REINDEX_OBJECT_INDEX);
+						{
+							if (rs->kind == REINDEX_OBJECT_INDEX)
+								mic_check_reindex_exprs(relid, true);
+							else
+								mic_check_tree_index_exprs(relid, rs->relation->inh);
+						}
 					}
 					else if (rs->kind == REINDEX_OBJECT_SCHEMA)
 					{
@@ -414,6 +553,133 @@ mic_utility_command(PlannedStmt *pstmt,
 					 * REINDEX SYSTEM touches only system catalogs, which are
 					 * exempt (OID below the threshold), so nothing to check.
 					 */
+					break;
+				}
+			case T_VacuumStmt:
+				{
+					/*
+					 * VACUUM (FULL) and ANALYZE evaluate index and statistics
+					 * expressions, and REPACK/CLUSTER below rebuild indexes,
+					 * all after switching to the table owner's identity.
+					 * Like REINDEX, the invoking subject is the one being
+					 * lured, so it is checked before the switch.
+					 */
+					VacuumStmt *vs = (VacuumStmt *) parsetree;
+					ListCell   *lc;
+
+					if (vs->rels == NIL)
+					{
+						mic_check_reindex_relations(InvalidOid);
+						break;
+					}
+					foreach(lc, vs->rels)
+					{
+						VacuumRelation *vr = lfirst_node(VacuumRelation, lc);
+						Oid			relid = vr->oid;
+
+						if (!OidIsValid(relid) && vr->relation != NULL)
+							relid = RangeVarGetRelid(vr->relation,
+													 AccessShareLock, true);
+						if (OidIsValid(relid))
+							mic_check_tree_index_exprs(relid,
+													   vr->relation ? vr->relation->inh : true);
+					}
+					break;
+				}
+#if PG_VERSION_NUM >= 190000
+			case T_RepackStmt:
+				{
+					/* REPACK / CLUSTER / VACUUM FULL: relation is a VacuumRelation */
+					RepackStmt *cs = (RepackStmt *) parsetree;
+					RangeVar   *rv = cs->relation ? cs->relation->relation : NULL;
+					Oid			relid = cs->relation ? cs->relation->oid : InvalidOid;
+#else
+			case T_ClusterStmt:
+				{
+					ClusterStmt *cs = (ClusterStmt *) parsetree;
+					RangeVar   *rv = cs->relation;
+					Oid			relid = InvalidOid;
+#endif
+					if (!OidIsValid(relid) && rv != NULL)
+						relid = RangeVarGetRelid(rv, AccessShareLock, true);
+					if (OidIsValid(relid))
+						mic_check_tree_index_exprs(relid, rv ? rv->inh : true);
+					else if (rv == NULL)
+						mic_check_reindex_relations(InvalidOid);
+					break;
+				}
+			case T_RefreshMatViewStmt:
+				{
+					RefreshMatViewStmt *rm = (RefreshMatViewStmt *) parsetree;
+					Oid			relid = RangeVarGetRelid(rm->relation,
+														 AccessShareLock,
+														 true);
+
+					if (OidIsValid(relid))
+						mic_check_matview_refresh(relid);
+					break;
+				}
+			case T_CreateStatsStmt:
+				{
+					/*
+					 * Statistics expressions run at every ANALYZE, including
+					 * autovacuum's; refuse to attach a lower-level function
+					 * to a table in the first place.
+					 */
+					CreateStatsStmt *st = (CreateStatsStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					if (lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+						ListCell   *lc;
+
+						ctx.subject_level = lvl;
+						ctx.objname = "statistics object";
+						ctx.what = "CREATE STATISTICS expression for";
+						foreach(lc, st->exprs)
+						{
+							Node	   *e = (Node *) lfirst(lc);
+
+							if (IsA(e, StatsElem))
+								(void) mic_raw_func_walker(((StatsElem *) e)->expr, &ctx);
+							else
+								(void) mic_raw_func_walker(e, &ctx);
+						}
+					}
+					break;
+				}
+			case T_CreateTrigStmt:
+				{
+					CreateTrigStmt *ct = (CreateTrigStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					if (lvl > MIC_LEVEL_LOW && ct->relation != NULL)
+					{
+						RawFuncCtx	ctx;
+
+						ctx.subject_level = lvl;
+						ctx.objname = ct->relation->relname;
+						ctx.what = "CREATE TRIGGER on";
+						mic_check_raw_funcname(ct->funcname, &ctx);
+						(void) mic_raw_func_walker(ct->whenClause, &ctx);
+					}
+					break;
+				}
+			case T_CreateEventTrigStmt:
+				{
+					CreateEventTrigStmt *ce = (CreateEventTrigStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					if (lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+
+						ctx.subject_level = lvl;
+						ctx.objname = ce->trigname;
+						ctx.what = "CREATE EVENT TRIGGER";
+						mic_check_raw_funcname(ce->funcname, &ctx);
+					}
 					break;
 				}
 			case T_TruncateStmt:
@@ -501,7 +767,7 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	MarkGUCPrefixReserved("mic");
+	MIC_MARK_GUC_PREFIX_RESERVED("mic");
 
 	/* Security label provider */
 	register_label_provider(MIC_LABEL_TAG,
@@ -518,4 +784,10 @@ _PG_init(void)
 	/* ProcessUtility hook */
 	next_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = mic_utility_command;
+
+	/* Function manager hooks: every invocation of every user function */
+	next_needs_fmgr_hook = needs_fmgr_hook;
+	needs_fmgr_hook = mic_needs_fmgr_hook;
+	next_fmgr_hook = fmgr_hook;
+	fmgr_hook = mic_fmgr_hook;
 }

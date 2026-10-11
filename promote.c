@@ -120,7 +120,7 @@ mic_set_role_level(PG_FUNCTION_ARGS)
 	object.objectId = role_oid;
 	object.objectSubId = 0;
 
-	SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
+	mic_set_label(&object, level_str);
 
 	PG_RETURN_VOID();
 }
@@ -156,7 +156,7 @@ mic_promote_table(PG_FUNCTION_ARGS)
 	object.objectId = rel_oid;
 	object.objectSubId = 0;
 
-	SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
+	mic_set_label(&object, level_str);
 
 	PG_RETURN_VOID();
 }
@@ -189,7 +189,7 @@ mic_promote_object(PG_FUNCTION_ARGS)
 	object.objectId = object_id;
 	object.objectSubId = 0;
 
-	SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
+	mic_set_label(&object, level_str);
 
 	PG_RETURN_VOID();
 }
@@ -246,7 +246,7 @@ mic_initialize_labels(PG_FUNCTION_ARGS)
 			continue;
 		}
 
-		SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
+		mic_set_label(&object, level_str);
 	}
 
 	table_endscan(scan);
@@ -327,7 +327,7 @@ mic_promote_extension(PG_FUNCTION_ARGS)
 								obj.classId, obj.objectId)));
 			continue;
 		}
-		SetSecurityLabel(&obj, MIC_LABEL_TAG, level);
+		mic_set_label(&obj, level);
 		count++;
 	}
 	systable_endscan(scan);
