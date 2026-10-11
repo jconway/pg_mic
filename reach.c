@@ -19,10 +19,12 @@
 #include "access/transam.h"
 #include "access/htup_details.h"
 #include "access/tupdesc.h"
+#include "catalog/heap.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_policy.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_type.h"
@@ -85,21 +87,31 @@ collect_aggregate(FuncCollectCtx *ctx, Oid aggfnoid)
 static bool func_collect_walker(Node *node, FuncCollectCtx *ctx);
 
 /*
- * Append the functions reachable from a domain's CHECK constraints (and those
- * of any underlying domains) to ctx.  Fail-safe: a missing conbin collects
- * nothing and never raises an error.
+ * Append the functions reachable from a type's domain CHECK constraints to
+ * ctx.  The type is unwrapped through every layer that can carry a domain
+ * whose CHECK runs: a domain over a domain, an array of a domain, a range or
+ * multirange of a domain, a field of a composite type, and any combination
+ * thereof.  The recursion terminates because the type-nesting graph is acyclic
+ * (PostgreSQL forbids a domain or composite type that contains itself).
+ * Fail-safe: a missing conbin collects nothing and never raises an error.
  */
 static void
 collect_domain_check_funcs(Oid typid, FuncCollectCtx *ctx)
 {
-	int			depth = 0;
+	char		typtype;
 
-	while (depth++ < 32 && get_typtype(typid) == TYPTYPE_DOMAIN)
+	if (typid < MIC_SYSTEM_OID_THRESHOLD || !OidIsValid(typid))
+		return;
+
+	typtype = get_typtype(typid);
+
+	if (typtype == TYPTYPE_DOMAIN)
 	{
 		Relation	conrel;
 		ScanKeyData skey;
 		SysScanDesc scan;
 		HeapTuple	tup;
+		Oid			base = InvalidOid;
 
 		conrel = table_open(ConstraintRelationId, AccessShareLock);
 		ScanKeyInit(&skey, Anum_pg_constraint_contypid,
@@ -124,13 +136,54 @@ collect_domain_check_funcs(Oid typid, FuncCollectCtx *ctx)
 		systable_endscan(scan);
 		table_close(conrel, AccessShareLock);
 
-		/* step to the immediate parent type (may itself be a domain) */
+		/* follow the base type (another domain, or an array/range of one) */
 		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
-		if (!HeapTupleIsValid(tup))
-			break;
-		typid = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
-		ReleaseSysCache(tup);
+		if (HeapTupleIsValid(tup))
+		{
+			base = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+			ReleaseSysCache(tup);
+		}
+		collect_domain_check_funcs(base, ctx);
+		return;
 	}
+
+	/* array of a (possibly domain) element */
+	{
+		Oid			elem = get_element_type(typid);
+
+		if (OidIsValid(elem))
+		{
+			collect_domain_check_funcs(elem, ctx);
+			return;
+		}
+	}
+
+	/* composite type: unwrap each field (a field may be or contain a domain) */
+	if (typtype == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc_noerror(typid, -1, true);
+
+		if (tupdesc != NULL)
+		{
+			int			i;
+
+			for (i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+				if (!att->attisdropped)
+					collect_domain_check_funcs(att->atttypid, ctx);
+			}
+			ReleaseTupleDesc(tupdesc);
+		}
+		return;
+	}
+
+	/* range or multirange over a (possibly domain) subtype */
+	if (typtype == TYPTYPE_RANGE)
+		collect_domain_check_funcs(get_range_subtype(typid), ctx);
+	else if (typtype == TYPTYPE_MULTIRANGE)
+		collect_domain_check_funcs(get_multirange_range(typid), ctx);
 }
 
 static bool
@@ -409,46 +462,108 @@ check_index_exprs(Relation rel, int subject_level)
 	list_free(indexoids);
 }
 
-/* Domain CHECK constraints for domain-typed columns (run on write). */
+/*
+ * Domain CHECK constraints for a column's type (run on write).  The type is
+ * unwrapped through every layer that can carry a domain whose CHECK runs: a
+ * domain over a domain, an array of a domain, a range or multirange of a
+ * domain, and a field of a composite type.  Fail-closed: an unexpectedly
+ * absent conbin denies the write.
+ */
 static void
 check_domain_of_type(Oid typid, int subject_level, const char *relname)
 {
-	Relation	conrel;
-	ScanKeyData skey;
-	SysScanDesc scan;
-	HeapTuple	tup;
+	char		typtype;
 
-	if (get_typtype(typid) != TYPTYPE_DOMAIN)
+	if (typid < MIC_SYSTEM_OID_THRESHOLD || !OidIsValid(typid))
 		return;
 
-	conrel = table_open(ConstraintRelationId, AccessShareLock);
-	ScanKeyInit(&skey, Anum_pg_constraint_contypid,
-				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(typid));
-	scan = systable_beginscan(conrel, ConstraintTypidIndexId, true,
-							  NULL, 1, &skey);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(tup);
-		Datum		val;
-		bool		isnull;
+	typtype = get_typtype(typid);
 
-		if (c->contype != CONSTRAINT_CHECK)
-			continue;
-		val = heap_getattr(tup, Anum_pg_constraint_conbin,
-						   RelationGetDescr(conrel), &isnull);
-		if (isnull)
+	if (typtype == TYPTYPE_DOMAIN)
+	{
+		Relation	conrel;
+		ScanKeyData skey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+		Oid			base = InvalidOid;
+
+		conrel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&skey, Anum_pg_constraint_contypid,
+					BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(typid));
+		scan = systable_beginscan(conrel, ConstraintTypidIndexId, true,
+								  NULL, 1, &skey);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		{
-			ereport(mic_is_enforcing() ? ERROR : WARNING,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("pg_mic: cannot analyze domain constraint on \"%s\"",
-							relname)));
-			continue;
+			Form_pg_constraint c = (Form_pg_constraint) GETSTRUCT(tup);
+			Datum		val;
+			bool		isnull;
+
+			if (c->contype != CONSTRAINT_CHECK)
+				continue;
+			val = heap_getattr(tup, Anum_pg_constraint_conbin,
+							   RelationGetDescr(conrel), &isnull);
+			if (isnull)
+			{
+				ereport(mic_is_enforcing() ? ERROR : WARNING,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("pg_mic: cannot analyze domain constraint on \"%s\"",
+								relname)));
+				continue;
+			}
+			mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
+									 subject_level, "domain CHECK on", relname);
 		}
-		mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
-								 subject_level, "domain CHECK on", relname);
+		systable_endscan(scan);
+		table_close(conrel, AccessShareLock);
+
+		/* follow the base type (another domain, or an array/range of one) */
+		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (HeapTupleIsValid(tup))
+		{
+			base = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+			ReleaseSysCache(tup);
+		}
+		check_domain_of_type(base, subject_level, relname);
+		return;
 	}
-	systable_endscan(scan);
-	table_close(conrel, AccessShareLock);
+
+	/* array of a (possibly domain) element */
+	{
+		Oid			elem = get_element_type(typid);
+
+		if (OidIsValid(elem))
+		{
+			check_domain_of_type(elem, subject_level, relname);
+			return;
+		}
+	}
+
+	/* composite type: unwrap each field (a field may be or contain a domain) */
+	if (typtype == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc_noerror(typid, -1, true);
+
+		if (tupdesc != NULL)
+		{
+			int			i;
+
+			for (i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+				if (!att->attisdropped)
+					check_domain_of_type(att->atttypid, subject_level, relname);
+			}
+			ReleaseTupleDesc(tupdesc);
+		}
+		return;
+	}
+
+	/* range or multirange over a (possibly domain) subtype */
+	if (typtype == TYPTYPE_RANGE)
+		check_domain_of_type(get_range_subtype(typid), subject_level, relname);
+	else if (typtype == TYPTYPE_MULTIRANGE)
+		check_domain_of_type(get_multirange_range(typid), subject_level, relname);
 }
 
 static void
@@ -597,14 +712,19 @@ check_rls_policies(Relation rel, int subject_level, AclMode required_ops)
 	}
 }
 
-/* TRUNCATE-event triggers (not an ExecutorCheckPerms operation) */
+/*
+ * TRUNCATE-event triggers (not an ExecutorCheckPerms operation).  relids is
+ * the already inheritance-expanded set of explicitly-named target relations;
+ * when cascade is true, the transitive FK-referencing closure is added (each
+ * reached relation itself expanded to its inheritance/partition tree), exactly
+ * as ExecuteTruncate builds the set of relations whose TRUNCATE triggers fire.
+ */
 void
-mic_check_truncate_triggers(Oid relid)
+mic_check_truncate_triggers(List *relids, bool cascade)
 {
 	int			subject_level;
-	Relation	rel;
-	TriggerDesc *td;
-	int			i;
+	List	   *all = NIL;
+	ListCell   *lc;
 
 	if (mic_mode == MIC_MODE_DISABLED)
 		return;
@@ -613,24 +733,74 @@ mic_check_truncate_triggers(Oid relid)
 	if (subject_level <= MIC_LEVEL_LOW)
 		return;
 
-	if (relid < MIC_SYSTEM_OID_THRESHOLD)
-		return;
-
-	rel = try_table_open(relid, AccessShareLock);
-	if (rel == NULL)
-		return;
-
-	td = rel->trigdesc;
-	for (i = 0; td != NULL && i < td->numtriggers; i++)
+	foreach(lc, relids)
 	{
-		Trigger    *tg = &td->triggers[i];
+		Oid			relid = lfirst_oid(lc);
 
-		if (TRIGGER_FOR_TRUNCATE(tg->tgtype))
-			mic_check_one_function(tg->tgfoid, subject_level,
-								   "truncate trigger on",
-								   RelationGetRelationName(rel));
+		if (OidIsValid(relid) && relid >= MIC_SYSTEM_OID_THRESHOLD)
+			all = list_append_unique_oid(all, relid);
 	}
-	table_close(rel, AccessShareLock);
+
+	/* CASCADE truncates FK-referencing tables too; add their closure. */
+	if (cascade)
+	{
+		for (;;)
+		{
+			List	   *fks = heap_truncate_find_FKs(all);
+			ListCell   *l2;
+			bool		added = false;
+
+			if (fks == NIL)
+				break;
+			foreach(l2, fks)
+			{
+				List	   *inh = find_all_inheritors(lfirst_oid(l2),
+													  AccessShareLock, NULL);
+				ListCell   *l3;
+
+				foreach(l3, inh)
+				{
+					Oid			c = lfirst_oid(l3);
+
+					if (c >= MIC_SYSTEM_OID_THRESHOLD &&
+						!list_member_oid(all, c))
+					{
+						all = lappend_oid(all, c);
+						added = true;
+					}
+				}
+				list_free(inh);
+			}
+			list_free(fks);
+			if (!added)
+				break;
+		}
+	}
+
+	foreach(lc, all)
+	{
+		Oid			relid = lfirst_oid(lc);
+		Relation	rel;
+		TriggerDesc *td;
+		int			i;
+
+		rel = try_table_open(relid, AccessShareLock);
+		if (rel == NULL)
+			continue;
+
+		td = rel->trigdesc;
+		for (i = 0; td != NULL && i < td->numtriggers; i++)
+		{
+			Trigger    *tg = &td->triggers[i];
+
+			if (TRIGGER_FOR_TRUNCATE(tg->tgtype))
+				mic_check_one_function(tg->tgfoid, subject_level,
+									   "truncate trigger on",
+									   RelationGetRelationName(rel));
+		}
+		table_close(rel, AccessShareLock);
+	}
+	list_free(all);
 }
 
 void
@@ -720,4 +890,53 @@ mic_check_reindex_exprs(Oid relid, bool is_index)
 		return;
 	check_index_exprs(rel, subject_level);
 	table_close(rel, AccessShareLock);
+}
+
+/*
+ * REINDEX SCHEMA / DATABASE rebuilds every index under one command, so expand
+ * the target to the affected user relations and check each one's stored index
+ * expressions/predicates against the invoking subject.  nspoid restricts to a
+ * single schema (REINDEX SCHEMA); InvalidOid covers the whole database
+ * (REINDEX DATABASE).  System catalogs (OID below the threshold) are exempt,
+ * so REINDEX SYSTEM has nothing user-defined to check and never calls here.
+ */
+void
+mic_check_reindex_relations(Oid nspoid)
+{
+	int			subject_level;
+	Relation	classrel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	classrel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classrel, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+		Relation	rel;
+
+		if (c->relkind != RELKIND_RELATION &&
+			c->relkind != RELKIND_MATVIEW &&
+			c->relkind != RELKIND_PARTITIONED_TABLE)
+			continue;
+		if (c->oid < MIC_SYSTEM_OID_THRESHOLD)
+			continue;
+		if (OidIsValid(nspoid) && c->relnamespace != nspoid)
+			continue;
+
+		rel = try_table_open(c->oid, AccessShareLock);
+		if (rel == NULL)
+			continue;
+		check_index_exprs(rel, subject_level);
+		table_close(rel, AccessShareLock);
+	}
+	systable_endscan(scan);
+	table_close(classrel, AccessShareLock);
 }

@@ -14,6 +14,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "commands/seclabel.h"
@@ -400,22 +401,53 @@ mic_utility_command(PlannedStmt *pstmt,
 							mic_check_reindex_exprs(relid,
 													rs->kind == REINDEX_OBJECT_INDEX);
 					}
+					else if (rs->kind == REINDEX_OBJECT_SCHEMA)
+					{
+						Oid			nspoid = get_namespace_oid(rs->name, true);
+
+						if (OidIsValid(nspoid))
+							mic_check_reindex_relations(nspoid);
+					}
+					else if (rs->kind == REINDEX_OBJECT_DATABASE)
+						mic_check_reindex_relations(InvalidOid);
+					/*
+					 * REINDEX SYSTEM touches only system catalogs, which are
+					 * exempt (OID below the threshold), so nothing to check.
+					 */
 					break;
 				}
 			case T_TruncateStmt:
 				{
 					TruncateStmt *ts = (TruncateStmt *) parsetree;
+					List	   *relids = NIL;
 					ListCell   *lc;
 
+					/*
+					 * Build the set of explicitly-named relations whose
+					 * TRUNCATE triggers will fire, expanding inheritance and
+					 * partition trees (unless ONLY was given, honoring
+					 * rv->inh).  reach.c adds the CASCADE FK closure.
+					 */
 					foreach(lc, ts->relations)
 					{
 						RangeVar   *rv = lfirst_node(RangeVar, lc);
 						Oid			relid = RangeVarGetRelid(rv, AccessShareLock,
 															 true);
 
-						if (OidIsValid(relid))
-							mic_check_truncate_triggers(relid);
+						if (!OidIsValid(relid))
+							continue;
+						if (rv->inh)
+							relids = list_concat(relids,
+												 find_all_inheritors(relid,
+																	 AccessShareLock,
+																	 NULL));
+						else
+							relids = lappend_oid(relids, relid);
 					}
+					if (relids != NIL)
+						mic_check_truncate_triggers(relids,
+													ts->behavior == DROP_CASCADE);
+					list_free(relids);
 					break;
 				}
 			default:

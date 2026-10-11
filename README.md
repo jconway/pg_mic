@@ -62,20 +62,24 @@ retained as a backstop.
 
 Covered attachment points:
 
-- triggers (including TRUNCATE triggers)
+- triggers, including TRUNCATE triggers reached indirectly through partitions,
+  inheritance children, and the `CASCADE` foreign-key closure
 - CHECK constraints
 - column defaults
 - STORED and VIRTUAL generated columns
 - index expressions and index predicates
 - exclusion-constraint operators
 - RLS `USING` / `WITH CHECK` policies
-- domain CHECK constraints
+- domain CHECK constraints, including a domain nested under another domain, the
+  element/subtype of an array, range, or multirange of a domain, and a domain
+  reached through a field of a composite type
 
 Built-in functions (OID < 16384) are exempt, so ordinary SQL works for all
 users. Enforcement is driven from both the executor (DML) and ProcessUtility
-(COPY, TRUNCATE, CREATE INDEX / REINDEX, and ALTER TABLE validate/rewrite
-subcommands), since those utility commands run catalog-stored code over rows
-without going through the normal executor checks.
+(COPY, TRUNCATE, CREATE INDEX / REINDEX including `REINDEX SCHEMA` and
+`REINDEX DATABASE`, and ALTER TABLE validate/rewrite subcommands), since those
+utility commands run catalog-stored code over rows without going through the
+normal executor checks.
 
 ## Installation
 
@@ -288,9 +292,9 @@ version differences are handled with guards in `pg_mic_compat.h`.
 - **The utility path covers an enumerated set** of commands/subcommands. A new
   PostgreSQL command that executes code over rows would need to be added to
   that enumeration.
-- **Not followed:** nested domains (a domain over a domain); arrays/ranges of
-  domains; TRUNCATE triggers on partitions, inheritance children, or
-  CASCADE-reached foreign-key tables; REINDEX SCHEMA / DATABASE / SYSTEM.
+- **REINDEX SYSTEM** has nothing to check: it rebuilds only system catalogs,
+  whose indexes are all system objects (OID below the threshold) and therefore
+  exempt.
 
 ## Running Tests
 

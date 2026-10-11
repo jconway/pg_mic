@@ -316,6 +316,34 @@ CREATE TABLE r_domcast (x int CHECK ((x::public.low_dom2) >= 0));
 INSERT INTO r_domcast VALUES (1);      -- denied: cast-to-domain CHECK reaches LOW fn
 
 -- ============================================================
+-- Reachable-function enforcement: nested / array / range of domain
+-- (the LOW CHECK lives on a domain reached only by unwrapping the
+-- column type through a domain, an array, or a range)
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_ndchk(int) RETURNS boolean
+    AS 'SELECT $1 >= 0' LANGUAGE sql IMMUTABLE;
+-- domain over a domain: the CHECK is on the inner domain
+CREATE DOMAIN public.low_inner AS int CHECK (public.low_ndchk(VALUE));
+CREATE DOMAIN public.low_outer AS public.low_inner;
+-- array of a domain
+CREATE DOMAIN public.low_elem AS int CHECK (public.low_ndchk(VALUE));
+-- range over a domain
+CREATE DOMAIN public.low_rsub AS int CHECK (public.low_ndchk(VALUE));
+CREATE TYPE public.low_rng AS RANGE (subtype = public.low_rsub);
+-- composite type with a domain field
+CREATE TYPE public.low_comp AS (a public.low_elem);
+RESET ROLE;
+CREATE TABLE r_nd (v public.low_outer);
+INSERT INTO r_nd VALUES (1);           -- denied: nested domain CHECK reaches LOW fn
+CREATE TABLE r_ad (v public.low_elem[]);
+INSERT INTO r_ad VALUES ('{1}');       -- denied: array element domain CHECK reaches LOW fn
+CREATE TABLE r_rd (v public.low_rng);
+INSERT INTO r_rd VALUES ('[1,2]');     -- denied: range subtype domain CHECK reaches LOW fn
+CREATE TABLE r_cd (v public.low_comp);
+INSERT INTO r_cd VALUES (ROW(1));      -- denied: composite field domain CHECK reaches LOW fn
+
+-- ============================================================
 -- Reachable-function enforcement: RLS policies
 -- ============================================================
 SET ROLE mic_low_user;
@@ -370,6 +398,32 @@ CREATE TRIGGER t_tr BEFORE TRUNCATE ON r_trunc
     FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc();
 TRUNCATE r_trunc;                      -- denied: LOW truncate trigger
 
+-- TRUNCATE reaches triggers on partitions, inheritance children, and
+-- CASCADE-referencing tables -- none named in the statement
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_trunc2() RETURNS trigger
+    AS 'BEGIN RETURN NULL; END' LANGUAGE plpgsql;
+RESET ROLE;
+-- partition: trigger on the partition, TRUNCATE the partitioned parent
+CREATE TABLE r_tpar (id int) PARTITION BY RANGE (id);
+CREATE TABLE r_tpar_p1 PARTITION OF r_tpar FOR VALUES FROM (0) TO (100);
+CREATE TRIGGER t_tp BEFORE TRUNCATE ON r_tpar_p1
+    FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
+TRUNCATE r_tpar;                       -- denied: partition's LOW truncate trigger
+-- inheritance child: trigger on the child, TRUNCATE the parent
+CREATE TABLE r_tparent (id int);
+CREATE TABLE r_tchild (id int) INHERITS (r_tparent);
+CREATE TRIGGER t_tc BEFORE TRUNCATE ON r_tchild
+    FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
+TRUNCATE r_tparent;                    -- denied: child's LOW truncate trigger
+TRUNCATE ONLY r_tparent;               -- allowed: ONLY does not reach the child
+-- CASCADE: the FK-referencing table carries the LOW truncate trigger
+CREATE TABLE r_tref (id int PRIMARY KEY);
+CREATE TABLE r_tdep (id int REFERENCES r_tref(id));
+CREATE TRIGGER t_td BEFORE TRUNCATE ON r_tdep
+    FOR EACH STATEMENT EXECUTE FUNCTION public.low_trunc2();
+TRUNCATE r_tref CASCADE;               -- denied: FK-cascade reaches r_tdep's LOW trigger
+
 -- ============================================================
 -- Utility path: CREATE INDEX / REINDEX over existing rows
 -- ============================================================
@@ -396,6 +450,19 @@ CREATE INDEX r_ixr_e ON r_ixr (public.ixr_fn(id));                   -- allowed 
 RESET ROLE;
 REINDEX INDEX r_ixr_e;                                               -- denied
 REINDEX TABLE r_ixr;                                                 -- denied
+-- REINDEX SCHEMA expands to every relation in the schema (REINDEX DATABASE
+-- uses the same path with no namespace filter; REINDEX SYSTEM hits only
+-- exempt catalogs).  Isolate in a dedicated schema for a deterministic result.
+CREATE SCHEMA mic_rx;
+GRANT USAGE, CREATE ON SCHEMA mic_rx TO mic_low_user;
+SET ROLE mic_low_user;
+CREATE FUNCTION mic_rx.low_sixbuild(int) RETURNS int AS
+  $$ BEGIN RETURN $1; END $$ LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE mic_rx.r_sidx (id int);
+INSERT INTO mic_rx.r_sidx SELECT g FROM generate_series(1,3) g;
+CREATE INDEX r_sidx_e ON mic_rx.r_sidx (mic_rx.low_sixbuild(id));    -- allowed (LOW)
+RESET ROLE;
+REINDEX SCHEMA mic_rx;                 -- denied: schema holds a LOW expression index
 
 -- ============================================================
 -- Utility path: ALTER TABLE ADD CONSTRAINT validating existing rows
@@ -408,7 +475,11 @@ INSERT INTO r_at VALUES (1);
 ALTER TABLE r_at ADD CONSTRAINT c_chk CHECK (public.low_atchk(id));  -- denied: validates rows
 ALTER TABLE r_at ADD CONSTRAINT c_ok CHECK (id >= 0);  -- allowed: built-in only
 ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.low_atchk(1)::int::int + 0;  -- denied: bare raw default walked
-ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.nosuchfn(1);  -- unresolvable name: plain parse error, not a pg_mic error
+-- unresolvable name: plain parse error, not a pg_mic error (terse: the
+-- optional HINT on "function does not exist" varies across major versions)
+\set VERBOSITY terse
+ALTER TABLE r_at ALTER COLUMN id SET DEFAULT public.nosuchfn(1);
+\set VERBOSITY default
 
 -- ============================================================
 -- Bulk extension promotion
@@ -440,12 +511,18 @@ DROP FUNCTION public.low_atchk(int);
 DROP TABLE r_ixb;
 DROP TABLE r_idx_builtin;
 DROP TABLE r_ixr;
+DROP SCHEMA mic_rx CASCADE;
 DROP FUNCTION public.low_ixbuild(int);
 DROP FUNCTION public.ixr_fn(int);
 DROP TABLE r_copy;
 DROP TABLE r_trunc;
+DROP TABLE r_tpar;
+DROP TABLE r_tparent CASCADE;
+DROP TABLE r_tdep;
+DROP TABLE r_tref;
 DROP FUNCTION public.low_copychk(int);
 DROP FUNCTION public.low_trunc();
+DROP FUNCTION public.low_trunc2();
 DROP TABLE r_rls_ok;
 DROP TABLE r_rls_pri;
 DROP ROLE mic_rls_high;
@@ -457,6 +534,17 @@ DROP FUNCTION public.low_domchk2(int);
 DROP TABLE r_dom;
 DROP DOMAIN public.low_dom;
 DROP FUNCTION public.low_domchk(int);
+DROP TABLE r_cd;
+DROP TABLE r_rd;
+DROP TABLE r_ad;
+DROP TABLE r_nd;
+DROP TYPE public.low_comp;
+DROP TYPE public.low_rng;
+DROP DOMAIN public.low_rsub;
+DROP DOMAIN public.low_elem;
+DROP DOMAIN public.low_outer;
+DROP DOMAIN public.low_inner;
+DROP FUNCTION public.low_ndchk(int);
 DROP TABLE r_idx;
 DROP TABLE r_idxp;
 DROP FUNCTION public.low_ident(int);
