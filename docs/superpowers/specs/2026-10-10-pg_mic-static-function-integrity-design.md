@@ -6,6 +6,25 @@
 - **Target:** PostgreSQL master (20devel), built/tested only against
   `~/projects/claude/pgsql/postgresql`
 
+> **Revision note (2026-10-14, v1.0-beta3).** This spec was written for the
+> static-reachability work and was approved as such. Two later adversarial
+> reviews changed the architecture in ways the original text does not
+> reflect; the affected sections carry inline corrections marked
+> *[amended]*. In summary: (a) the function-manager hook, not
+> `OAT_FUNCTION_EXECUTE`, is the authoritative runtime layer, and a function
+> below HIGH is therefore never inlined (the "inlinable LOW SQL is a
+> non-escape" argument in §3/§12 is moot, not relied on); (b) the subject's
+> level is the higher of the outer and current user, so an owner switch
+> (`SECURITY DEFINER`, `VACUUM`, replication apply) never lowers it; (c)
+> rules and operators are labeled, checked objects, and `CREATE
+> TRIGGER`/`POLICY`/`RULE`/`INDEX`/`STATISTICS` and every `ALTER TABLE`
+> subcommand are gated both as writes to the relation and, for subjects
+> above LOW, at definition time; (d) domain `DEFAULT` and extended-statistics
+> expressions are in the reachable set; (e) `mic_promote_extension` skips
+> members owned below the target level and labels the extension; (f)
+> `mic_initialize_labels` labels by owner; (g) only HIGH subjects may own
+> subscriptions. The README is the current description of behavior.
+
 ## 1. Context and Problem
 
 `pg_mic` enforces a Biba-style mandatory integrity model with three levels
@@ -72,6 +91,14 @@ hook." We need enforcement that does not depend on the runtime hook firing.
 
 ### Transitivity: why nested references need no static recursion
 
+*[amended]* The reasoning below predates the function-manager layer. Since
+v1.0-beta1 a function labeled below HIGH is registered with
+`needs_fmgr_hook`, which the planner refuses to inline, so a lower SQL
+function is never inlined into a higher subject's query at all; nested
+inlining cannot occur and the "read-only inlined LOW SQL" residual below no
+longer exists. The static walk still does not recurse into function bodies,
+for the reason that every nested call is a real `fmgr` invocation.
+
 We check the functions **directly referenced** by each stored attachment
 expression (§5). These reads are inlining-immune because they read the
 stored node tree, which retains the referenced function's OID. We
@@ -120,7 +147,21 @@ executor, plus the retained runtime hook as a backstop:
    read-check directly-executed non-inlined functions (defense-in-depth and
    the catch for opaque nested calls).
 
-No change to the label provider or to create-time labeling from prior work.
+*[amended]* The authoritative runtime layer is the function-manager hook
+(`needs_fmgr_hook`/`fmgr_hook`), which sees every invocation of every
+function below HIGH from every call site; `OAT_FUNCTION_EXECUTE` is the
+early (expression-initialization) denial, and the static walks are the
+pre-side-effect denial. The subject at every layer is the higher of the
+outer and current user (`mic_get_subject_level`), so `fmgr_security_definer`
+switching to a lower owner before calling the hook does not lower it.
+Rules and operators are labeled at `OAT_POST_CREATE` alongside relations
+and functions; `OAT_POST_CREATE` on an already-labeled object (a `CREATE OR
+REPLACE`) is first checked as a write; `OAT_DROP`/`OAT_POST_ALTER` apply the
+write check to every labeled class (relations incl. columns, functions,
+rules, operators, types, schemas, extensions). A `planner_hook` walks each
+query for user-defined operators below the subject.
+
+No change to the label provider from prior work.
 
 ## 5. Reachable-set per operation
 
@@ -225,9 +266,20 @@ DML — the overwhelming surface — is fully covered by the executor path;
 (2) the runtime hook still fires for any non-inlined function these commands
 execute (backstop); (3) the command/subcommand list is the documented
 maintenance surface — a new PG command that executes code is a visible gap,
-not a silent one. Pure attachment commands (`CREATE TRIGGER`/`POLICY`/
+not a silent one. ~~Pure attachment commands (`CREATE TRIGGER`/`POLICY`/
 `RULE`) are deliberately not gated: they execute nothing, and the trap they
-set is caught at use-time by the executor path.
+set is caught at use-time by the executor path.~~ *[amended]* Attachment
+commands are gated twice: as a **write to the relation** (`CREATE
+INDEX`/`TRIGGER`/`RULE`/`POLICY`/`STATISTICS`, every `ALTER TABLE`
+subcommand, `ADD COLUMN`), so that a lower owner cannot change what a
+promoted relation does; and, for subjects above LOW, at **definition time**
+by walking the raw expressions (`CREATE TRIGGER` function and `WHEN`,
+`CREATE RULE` condition and actions, policies, domains incl. `DEFAULT`,
+statistics, `CREATE TABLE`), so that a higher subject cannot define an
+object in terms of lower code. `CREATE SUBSCRIPTION` and `ALTER
+SUBSCRIPTION ... OWNER TO` require a HIGH subject/owner because the apply
+worker bypasses the executor's permission check. `VACUUM`/`ANALYZE`/
+`CLUSTER` paths also walk `pg_statistic_ext.stxexprs`.
 
 ## 8. Error/audit, modes, performance
 
@@ -337,11 +389,10 @@ names throughout; after the rename step they become `mic_*` / `mic.*` /
 
 ## 12. Limitations and non-escapes (to document in README)
 
-- **Nested inlined SQL is not an escape** (stated so it isn't mistaken for a
-  gap): a LOW SQL function reached only by inlining inside an allowed
-  function is read-only, and any table access or non-inlined call it
-  performs is independently enforced (executor table check / runtime hook).
-  No static body recursion is done or needed.
+- ~~**Nested inlined SQL is not an escape**~~ *[amended]* A function below
+  HIGH is never inlined (it is hooked, and the planner does not inline
+  hooked functions), so there is no inlined lower SQL to reason about. The
+  current list of limitations and non-escapes is maintained in the README.
 - The utility path (§7) covers an enumerated set of commands/subcommands; a
   new PostgreSQL command that executes code over rows would need to be added
   to that enumeration (fail-visible, not silent).

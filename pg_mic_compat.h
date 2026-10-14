@@ -16,6 +16,8 @@
 #include "access/transam.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "optimizer/planner.h"
+#include "miscadmin.h"
 #include "utils/acl.h"
 
 StaticAssertDecl(PG_VERSION_NUM >= 140000,
@@ -75,6 +77,32 @@ typedef struct MicPermEntry
 #else
 #define MIC_FUNCNAME_GET_CANDIDATES(names) \
 	FuncnameGetCandidates((names), -1, NIL, false, false, false, true)
+#endif
+
+/*
+ * planner_hook gained a trailing ExplainState *es argument in PG19.
+ */
+#if PG_VERSION_NUM >= 190000
+#define MIC_PLANNER_PROTO(name) \
+	static PlannedStmt *name(Query *parse, const char *query_string, \
+							 int cursorOptions, ParamListInfo boundParams, \
+							 ExplainState *es)
+#define MIC_CALL_PLANNER(fn) \
+	(*(fn)) (parse, query_string, cursorOptions, boundParams, es)
+#else
+#define MIC_PLANNER_PROTO(name) \
+	static PlannedStmt *name(Query *parse, const char *query_string, \
+							 int cursorOptions, ParamListInfo boundParams)
+#define MIC_CALL_PLANNER(fn) \
+	(*(fn)) (parse, query_string, cursorOptions, boundParams)
+#endif
+
+/* IsAutoVacuumWorkerProcess() became AmAutoVacuumWorkerProcess() in PG17. */
+#if PG_VERSION_NUM >= 170000
+#define MIC_AM_AUTOVACUUM_WORKER() AmAutoVacuumWorkerProcess()
+#else
+#include "postmaster/autovacuum.h"
+#define MIC_AM_AUTOVACUUM_WORKER() IsAutoVacuumWorkerProcess()
 #endif
 
 /* Defined in dml.c.  Returns List* of MicPermEntry*. */

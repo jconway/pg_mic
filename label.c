@@ -20,6 +20,7 @@
 #include "commands/seclabel.h"
 #include "miscadmin.h"
 #include "pg_mic.h"
+#include "pg_mic_compat.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
 
@@ -103,24 +104,21 @@ mic_level_to_string(int level)
 }
 
 /*
- * Determine the integrity level of the current session (subject).
- *
- * - Superuser => HIGH
- * - Labeled role => label value
- * - Unlabeled role => LOW
+ * Integrity level of a role: a superuser is HIGH; otherwise its label, or
+ * LOW when it has none.
  */
 int
-mic_get_subject_level(void)
+mic_get_role_level_oid(Oid roleid)
 {
 	ObjectAddress object;
 	char	   *label;
 	int			level;
 
-	if (superuser())
+	if (superuser_arg(roleid))
 		return MIC_LEVEL_HIGH;
 
 	object.classId = AuthIdRelationId;
-	object.objectId = GetUserId();
+	object.objectId = roleid;
 	object.objectSubId = 0;
 
 	label = GetSecurityLabel(&object, MIC_LABEL_TAG);
@@ -131,6 +129,41 @@ mic_get_subject_level(void)
 	pfree(label);
 
 	return (level != MIC_LEVEL_INVALID) ? level : MIC_LEVEL_LOW;
+}
+
+/*
+ * Determine the integrity level of the subject: the identity on whose
+ * behalf the current operation runs.
+ *
+ * PostgreSQL keeps two identities a subject can be judged by.  The outer
+ * user is the one established by login and SET ROLE; the current user may
+ * additionally have been switched, within a single operation, to the owner
+ * of a SECURITY DEFINER function, of a table being vacuumed or clustered, of
+ * a materialized view being refreshed, or of a table receiving replicated
+ * rows.  Every one of those switches is made by the system on the outer
+ * user's behalf, so the operation is still the outer user's: a switch to a
+ * lower-level owner must not lower the subject, or any lower user could
+ * launder their code past the checks simply by marking it SECURITY DEFINER.
+ * The subject is therefore the higher of the two.  SET ROLE changes both,
+ * so a HIGH user who deliberately lowers themselves is lowered.
+ *
+ * An autovacuum worker has no outer subject at all: its "session" is the
+ * bootstrap superuser only as an artifact of how it was started, and it
+ * runs each table's code as that table's owner.  It is judged by the
+ * current (owner) identity alone, so that a LOW table with LOW index
+ * expressions keeps getting vacuumed.
+ */
+int
+mic_get_subject_level(void)
+{
+	int			cur = mic_get_role_level_oid(GetUserId());
+	int			outer;
+
+	if (MIC_AM_AUTOVACUUM_WORKER())
+		return cur;
+
+	outer = mic_get_role_level_oid(GetOuterUserId());
+	return Max(cur, outer);
 }
 
 /*

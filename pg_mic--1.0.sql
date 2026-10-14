@@ -43,7 +43,7 @@ AS 'MODULE_PATHNAME', 'mic_promote_extension'
 LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION mic_initialize_labels()
-RETURNS void
+RETURNS integer
 AS 'MODULE_PATHNAME', 'mic_initialize_labels'
 LANGUAGE C STRICT VOLATILE;
 
@@ -58,13 +58,24 @@ SELECT
     CASE s.classoid
         WHEN 'pg_catalog.pg_class'::regclass THEN 'table'
         WHEN 'pg_catalog.pg_proc'::regclass THEN 'function'
+        WHEN 'pg_catalog.pg_operator'::regclass THEN 'operator'
+        WHEN 'pg_catalog.pg_rewrite'::regclass THEN 'rule'
+        WHEN 'pg_catalog.pg_type'::regclass THEN 'type'
         WHEN 'pg_catalog.pg_namespace'::regclass THEN 'schema'
+        WHEN 'pg_catalog.pg_extension'::regclass THEN 'extension'
         ELSE s.classoid::regclass::text
     END AS object_type,
     CASE s.classoid
         WHEN 'pg_catalog.pg_class'::regclass THEN s.objoid::regclass::text
         WHEN 'pg_catalog.pg_proc'::regclass THEN s.objoid::regprocedure::text
+        WHEN 'pg_catalog.pg_operator'::regclass THEN s.objoid::regoperator::text
+        WHEN 'pg_catalog.pg_rewrite'::regclass THEN
+            (SELECT r.ev_class::regclass::text || ' ' || r.rulename
+               FROM pg_rewrite r WHERE r.oid = s.objoid)
+        WHEN 'pg_catalog.pg_type'::regclass THEN s.objoid::regtype::text
         WHEN 'pg_catalog.pg_namespace'::regclass THEN s.objoid::regnamespace::text
+        WHEN 'pg_catalog.pg_extension'::regclass THEN
+            (SELECT e.extname FROM pg_extension e WHERE e.oid = s.objoid)
         ELSE s.objoid::text
     END AS object_name
 FROM pg_seclabel s

@@ -14,15 +14,20 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_type.h"
 #include "commands/seclabel.h"
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "optimizer/planner.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "pg_mic.h"
@@ -42,6 +47,7 @@ static ExecutorCheckPerms_hook_type next_exec_check_perms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static needs_fmgr_hook_type next_needs_fmgr_hook = NULL;
 static fmgr_hook_type next_fmgr_hook = NULL;
+static planner_hook_type next_planner_hook = NULL;
 
 /*
  * GUC variables
@@ -60,6 +66,30 @@ bool
 mic_is_enforcing(void)
 {
 	return mic_mode == MIC_MODE_ENFORCING;
+}
+
+/*
+ * The catalog classes whose objects carry an integrity label.  Relations,
+ * functions, rules and operators are labeled at creation; types, schemas
+ * and extensions only by explicit promotion.  Altering or dropping any of
+ * them is a write to the object.
+ */
+static bool
+mic_class_is_labeled(Oid classId)
+{
+	switch (classId)
+	{
+		case RelationRelationId:
+		case ProcedureRelationId:
+		case RewriteRelationId:
+		case OperatorRelationId:
+		case TypeRelationId:
+		case NamespaceRelationId:
+		case ExtensionRelationId:
+			return true;
+		default:
+			return false;
+	}
 }
 
 /*
@@ -92,30 +122,54 @@ mic_object_access(ObjectAccessType access,
 
 				/*
 				 * Assign the creator's integrity level to new objects.
-				 * Relations and functions are both first-class objects
-				 * under the Biba model, so each is labeled at creation.
-				 * Skip internal creations (toast tables, indexes from
-				 * ALTER TABLE, etc).
+				 * Relations, functions, rules and operators are all code
+				 * or data a subject can be made to run or read, so each is
+				 * labeled at creation.  Skip internal creations (toast
+				 * tables, indexes from ALTER TABLE, etc).
 				 *
-				 * ProcedureCreate fires this hook for CREATE OR REPLACE as
-				 * well, so a function re-defined by a lower-level subject
-				 * is relabeled down to that subject's level: its new body
-				 * is that subject's code.
+				 * CREATE OR REPLACE (of a function, a rule, or a view's
+				 * rule) fires this hook for the existing object as well.
+				 * Replacing an object is writing it, so a subject below the
+				 * object's current level is refused; otherwise the object
+				 * takes the replacing subject's level, since its new
+				 * definition is that subject's code.
 				 */
 				if (!is_internal && subId == 0 &&
 					(classId == RelationRelationId ||
-					 classId == ProcedureRelationId))
+					 classId == ProcedureRelationId ||
+					 classId == RewriteRelationId ||
+					 classId == OperatorRelationId))
 				{
 					ObjectAddress object;
 					const char *level_str;
+					char	   *existing;
 
 					object.classId = classId;
 					object.objectId = objectId;
 					object.objectSubId = 0;
 
+					existing = GetSecurityLabel(&object, MIC_LABEL_TAG);
+					if (existing != NULL)
+					{
+						pfree(existing);
+						mic_check_write(classId, objectId);
+					}
+
+					/*
+					 * Plain SetSecurityLabel, not mic_set_label: the
+					 * creating command has just inserted or updated the
+					 * object's own catalog row, which already broadcasts
+					 * the invalidation a relabel needs, and updating that
+					 * row again in the same command would fail with
+					 * "tuple already updated by self".
+					 */
 					level_str = mic_level_to_string(mic_get_subject_level());
 					SetSecurityLabel(&object, MIC_LABEL_TAG, level_str);
 				}
+				/* a new column (subId = attnum) is a write to its relation */
+				else if (!is_internal && subId != 0 &&
+						 classId == RelationRelationId)
+					mic_check_write(classId, objectId);
 			}
 			break;
 
@@ -126,7 +180,8 @@ mic_object_access(ObjectAccessType access,
 				if ((drop_arg->dropflags & PERFORM_DELETION_INTERNAL) != 0)
 					break;
 
-				if (classId == RelationRelationId && subId == 0)
+				/* subId != 0 is a column of the relation: still a write */
+				if (mic_class_is_labeled(classId))
 					mic_check_write(classId, objectId);
 			}
 			break;
@@ -138,7 +193,7 @@ mic_object_access(ObjectAccessType access,
 				if (pa_arg->is_internal)
 					break;
 
-				if (classId == RelationRelationId && subId == 0)
+				if (mic_class_is_labeled(classId))
 					mic_check_write(classId, objectId);
 			}
 			break;
@@ -216,7 +271,10 @@ mic_object_access(ObjectAccessType access,
  * interest, fmgr routes every one of its invocations through
  * fmgr_security_definer, which calls fmgr_hook at entry.  Checking the
  * current subject against the function's level there closes every call
- * site at once, in whatever identity the call actually executes.
+ * site at once.  Note that fmgr_security_definer has already switched the
+ * current user to the function's owner when fmgr_hook runs; the subject is
+ * computed from the outer user as well (see mic_get_subject_level), so a
+ * SECURITY DEFINER function cannot launder a lower owner past this check.
  *
  * SQL functions that the planner inlines are never invoked through fmgr, so
  * they are not seen here; their bodies are expressions whose own function
@@ -252,6 +310,72 @@ mic_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 
 	if (next_fmgr_hook)
 		(*next_fmgr_hook) (event, flinfo, private);
+}
+
+/*
+ * Operators are resolved by name through search_path, so a lower subject can
+ * define, say, public.=(int, int) over a built-in function with the wrong
+ * semantics and have a higher subject's query silently pick it up: no lower
+ * function ever executes, so the function checks never fire.  Operators are
+ * therefore labeled at creation like functions, and every query is walked
+ * here, after rewriting and before planning, for user-defined operators
+ * below the subject.  (Sort and grouping operators always come from an
+ * operator class, which only a superuser can create, so only direct
+ * operator applications need checking.)
+ */
+typedef struct OpCheckCtx
+{
+	int			subject_level;
+} OpCheckCtx;
+
+static bool
+mic_operator_walker(Node *node, OpCheckCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+			mic_check_one_operator(((OpExpr *) node)->opno, ctx->subject_level,
+								   "query", NULL);
+			break;
+		case T_ScalarArrayOpExpr:
+			mic_check_one_operator(((ScalarArrayOpExpr *) node)->opno,
+								   ctx->subject_level, "query", NULL);
+			break;
+		case T_RowCompareExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((RowCompareExpr *) node)->opnos)
+					mic_check_one_operator(lfirst_oid(lc), ctx->subject_level,
+										   "query", NULL);
+				break;
+			}
+		default:
+			break;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, mic_operator_walker, ctx, 0);
+	return expression_tree_walker(node, mic_operator_walker, ctx);
+}
+
+MIC_PLANNER_PROTO(mic_planner)
+{
+	if (mic_mode != MIC_MODE_DISABLED)
+	{
+		OpCheckCtx	ctx;
+
+		ctx.subject_level = mic_get_subject_level();
+		if (ctx.subject_level > MIC_LEVEL_LOW)
+			(void) mic_operator_walker((Node *) parse, &ctx);
+	}
+
+	if (next_planner_hook)
+		return MIC_CALL_PLANNER(next_planner_hook);
+	return MIC_CALL_PLANNER(standard_planner);
 }
 
 /*
@@ -379,16 +503,52 @@ mic_check_source_relation(RangeVar *rv)
 	mic_check_reachable_functions(relid, ACL_INSERT | ACL_UPDATE);
 }
 
-/* Check the stored index expressions of every relation in a tree. */
+/*
+ * Check the stored index expressions of every relation in a tree, and, for
+ * commands that also ANALYZE, its extended-statistics expressions.
+ */
 static void
-mic_check_tree_index_exprs(Oid relid, bool inh)
+mic_check_tree_index_exprs(Oid relid, bool inh, bool stats)
 {
 	List	   *rels = mic_relation_tree(relid, inh);
 	ListCell   *lc;
 
 	foreach(lc, rels)
+	{
 		mic_check_reindex_exprs(lfirst_oid(lc), false);
+		if (stats)
+			mic_check_stats_exprs(lfirst_oid(lc));
+	}
 	list_free(rels);
+}
+
+/*
+ * Attaching an index, trigger, rule, policy or statistics object to a
+ * relation changes what that relation does: it is a write to the relation,
+ * and a subject below the relation's level may not perform it even when DAC
+ * (ownership) would allow it.
+ */
+static void
+mic_check_definition_write(RangeVar *rv)
+{
+	Oid			relid;
+
+	if (rv == NULL)
+		return;
+	relid = RangeVarGetRelid(rv, AccessShareLock, true);
+	if (OidIsValid(relid))
+		mic_check_write(RelationRelationId, relid);
+}
+
+/* A subject below HIGH may not own or create a subscription (see README). */
+static void
+mic_require_high(int level, const char *what)
+{
+	if (level < MIC_LEVEL_HIGH && mic_is_enforcing())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_mic: %s requires a high integrity subject", what),
+				 errdetail("Rows applied by logical replication are written on the subscription owner's behalf without the DML integrity checks.")));
 }
 
 /*
@@ -516,6 +676,7 @@ mic_utility_command(PlannedStmt *pstmt,
 					IndexStmt  *is = (IndexStmt *) parsetree;
 					int			lvl = mic_get_subject_level();
 
+					mic_check_definition_write(is->relation);
 					if (lvl > MIC_LEVEL_LOW && is->relation != NULL)
 					{
 						RawFuncCtx	ctx;
@@ -537,6 +698,15 @@ mic_utility_command(PlannedStmt *pstmt,
 
 					if (!OidIsValid(relid))
 						break;
+
+					/*
+					 * Whatever the subcommand, ALTER TABLE rewrites the
+					 * relation's definition: a write to the relation.  Not
+					 * every subcommand reaches the object-access hook
+					 * (ADD CONSTRAINT, for one, reports only the new
+					 * constraint), so it is checked here once.
+					 */
+					mic_check_write(RelationRelationId, relid);
 
 					foreach(lc, at->cmds)
 					{
@@ -635,7 +805,7 @@ mic_utility_command(PlannedStmt *pstmt,
 							if (rs->kind == REINDEX_OBJECT_INDEX)
 								mic_check_reindex_exprs(relid, true);
 							else
-								mic_check_tree_index_exprs(relid, rs->relation->inh);
+								mic_check_tree_index_exprs(relid, rs->relation->inh, false);
 						}
 					}
 					else if (rs->kind == REINDEX_OBJECT_SCHEMA)
@@ -643,10 +813,10 @@ mic_utility_command(PlannedStmt *pstmt,
 						Oid			nspoid = get_namespace_oid(rs->name, true);
 
 						if (OidIsValid(nspoid))
-							mic_check_reindex_relations(nspoid);
+							mic_check_reindex_relations(nspoid, false);
 					}
 					else if (rs->kind == REINDEX_OBJECT_DATABASE)
-						mic_check_reindex_relations(InvalidOid);
+						mic_check_reindex_relations(InvalidOid, false);
 					/*
 					 * REINDEX SYSTEM touches only system catalogs, which are
 					 * exempt (OID below the threshold), so nothing to check.
@@ -667,7 +837,7 @@ mic_utility_command(PlannedStmt *pstmt,
 
 					if (vs->rels == NIL)
 					{
-						mic_check_reindex_relations(InvalidOid);
+						mic_check_reindex_relations(InvalidOid, true);
 						break;
 					}
 					foreach(lc, vs->rels)
@@ -680,7 +850,8 @@ mic_utility_command(PlannedStmt *pstmt,
 													 AccessShareLock, true);
 						if (OidIsValid(relid))
 							mic_check_tree_index_exprs(relid,
-													   vr->relation ? vr->relation->inh : true);
+													   vr->relation ? vr->relation->inh : true,
+													   true);
 					}
 					break;
 				}
@@ -701,9 +872,9 @@ mic_utility_command(PlannedStmt *pstmt,
 					if (!OidIsValid(relid) && rv != NULL)
 						relid = RangeVarGetRelid(rv, AccessShareLock, true);
 					if (OidIsValid(relid))
-						mic_check_tree_index_exprs(relid, rv ? rv->inh : true);
+						mic_check_tree_index_exprs(relid, rv ? rv->inh : true, true);
 					else if (rv == NULL)
-						mic_check_reindex_relations(InvalidOid);
+						mic_check_reindex_relations(InvalidOid, true);
 					break;
 				}
 			case T_RefreshMatViewStmt:
@@ -726,7 +897,13 @@ mic_utility_command(PlannedStmt *pstmt,
 					 */
 					CreateStatsStmt *st = (CreateStatsStmt *) parsetree;
 					int			lvl = mic_get_subject_level();
+					ListCell   *lcr;
 
+					foreach(lcr, st->relations)
+					{
+						if (IsA(lfirst(lcr), RangeVar))
+							mic_check_definition_write((RangeVar *) lfirst(lcr));
+					}
 					if (lvl > MIC_LEVEL_LOW)
 					{
 						RawFuncCtx	ctx;
@@ -763,6 +940,7 @@ mic_utility_command(PlannedStmt *pstmt,
 						qual = cp->qual;
 						with_check = cp->with_check;
 						polname = cp->policy_name;
+						mic_check_definition_write(cp->table);
 					}
 					else
 					{
@@ -771,6 +949,7 @@ mic_utility_command(PlannedStmt *pstmt,
 						qual = ap->qual;
 						with_check = ap->with_check;
 						polname = ap->policy_name;
+						mic_check_definition_write(ap->table);
 					}
 					if (lvl > MIC_LEVEL_LOW)
 					{
@@ -807,16 +986,24 @@ mic_utility_command(PlannedStmt *pstmt,
 					AlterDomainStmt *ad = (AlterDomainStmt *) parsetree;
 					int			lvl = mic_get_subject_level();
 
-					/* subtype 'C' = ADD CONSTRAINT; def is the Constraint */
-					if (ad->subtype == 'C' && ad->def != NULL &&
-						IsA(ad->def, Constraint) && lvl > MIC_LEVEL_LOW)
+					/*
+					 * subtype 'C' = ADD CONSTRAINT (def is the Constraint);
+					 * 'T' = SET DEFAULT (def is the raw default expression,
+					 * which every INSERT omitting a column of the domain's
+					 * type then evaluates).
+					 */
+					if (ad->def != NULL && lvl > MIC_LEVEL_LOW &&
+						(ad->subtype == 'C' || ad->subtype == 'T'))
 					{
 						RawFuncCtx	ctx;
 
 						ctx.subject_level = lvl;
 						ctx.objname = strVal(llast(ad->typeName));
 						ctx.what = "ALTER DOMAIN";
-						mic_walk_constraint((Constraint *) ad->def, &ctx);
+						if (IsA(ad->def, Constraint))
+							mic_walk_constraint((Constraint *) ad->def, &ctx);
+						else
+							(void) mic_raw_func_walker(ad->def, &ctx);
 					}
 					break;
 				}
@@ -825,6 +1012,7 @@ mic_utility_command(PlannedStmt *pstmt,
 					CreateTrigStmt *ct = (CreateTrigStmt *) parsetree;
 					int			lvl = mic_get_subject_level();
 
+					mic_check_definition_write(ct->relation);
 					if (lvl > MIC_LEVEL_LOW && ct->relation != NULL)
 					{
 						RawFuncCtx	ctx;
@@ -850,6 +1038,64 @@ mic_utility_command(PlannedStmt *pstmt,
 						ctx.objname = ce->trigname;
 						ctx.what = "CREATE EVENT TRIGGER";
 						mic_check_raw_funcname(ce->funcname, &ctx);
+					}
+					break;
+				}
+			case T_RuleStmt:
+				{
+					/*
+					 * A rule's actions are queries that later run with the
+					 * privileges of whoever touches the table (DAC on them
+					 * is checked as the rule owner).  Attaching one is a
+					 * write to the relation; a higher subject defining one
+					 * in terms of lower functions is refused up front.  The
+					 * rule itself is labeled at creation and checked by the
+					 * DML layer whenever its event fires.
+					 */
+					RuleStmt   *rs = (RuleStmt *) parsetree;
+					int			lvl = mic_get_subject_level();
+
+					mic_check_definition_write(rs->relation);
+					if (lvl > MIC_LEVEL_LOW)
+					{
+						RawFuncCtx	ctx;
+						ListCell   *lc;
+
+						ctx.subject_level = lvl;
+						ctx.objname = rs->rulename;
+						ctx.what = "CREATE RULE";
+
+						(void) mic_raw_func_walker(rs->whereClause, &ctx);
+						foreach(lc, rs->actions)
+						{
+							Node	   *a = (Node *) lfirst(lc);
+
+							/* the raw walker knows DML; a NOTIFY carries nothing */
+							if (IsA(a, SelectStmt) || IsA(a, InsertStmt) ||
+								IsA(a, UpdateStmt) || IsA(a, DeleteStmt)
+#if PG_VERSION_NUM >= 150000
+								|| IsA(a, MergeStmt)
+#endif
+								)
+								(void) mic_raw_func_walker(a, &ctx);
+						}
+					}
+					break;
+				}
+			case T_CreateSubscriptionStmt:
+				mic_require_high(mic_get_subject_level(), "CREATE SUBSCRIPTION");
+				break;
+			case T_AlterOwnerStmt:
+				{
+					AlterOwnerStmt *ao = (AlterOwnerStmt *) parsetree;
+
+					if (ao->objectType == OBJECT_SUBSCRIPTION)
+					{
+						Oid			newowner = get_rolespec_oid(ao->newowner, true);
+
+						if (OidIsValid(newowner))
+							mic_require_high(mic_get_role_level_oid(newowner),
+											 "ALTER SUBSCRIPTION ... OWNER TO");
 					}
 					break;
 				}
@@ -961,4 +1207,8 @@ _PG_init(void)
 	needs_fmgr_hook = mic_needs_fmgr_hook;
 	next_fmgr_hook = fmgr_hook;
 	fmgr_hook = mic_fmgr_hook;
+
+	/* Planner hook: user-defined operators in every query */
+	next_planner_hook = planner_hook;
+	planner_hook = mic_planner;
 }

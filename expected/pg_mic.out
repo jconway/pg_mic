@@ -903,7 +903,393 @@ RESET ROLE;
 SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
 ERROR:  pg_mic: "bogus" is not a valid integrity level
 HINT:  Valid levels are: low, medium, high.
+-- ============================================================
+-- Subject identity: an owner switch never lowers the subject
+-- ============================================================
+-- fmgr_security_definer switches to the function owner before fmgr_hook
+-- runs; the subject is the higher of the outer and current user, so a LOW
+-- SECURITY DEFINER function is still LOW code run by a HIGH subject
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_sdiff(a int, b int) RETURNS float8
+    AS 'BEGIN RETURN (a - b)::float8; END' LANGUAGE plpgsql IMMUTABLE
+    SECURITY DEFINER;
+CREATE TYPE public.low_sdrng AS RANGE (subtype = int, subtype_diff = public.low_sdiff);
+RESET ROLE;
+CREATE TABLE r_srng (r public.low_sdrng);
+CREATE INDEX r_srng_gist ON r_srng USING gist (r);
+INSERT INTO r_srng
+  SELECT format('[%s,%s)', g, g + 5)::public.low_sdrng
+    FROM generate_series(1, 300) g;    -- denied: SECURITY DEFINER does not launder the owner
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_sdiff"
+-- inside a HIGH SECURITY DEFINER function the subject is HIGH, whoever calls it
+CREATE FUNCTION public.high_sdef_level() RETURNS text
+    AS 'SELECT mic_get_session_level()' LANGUAGE sql SECURITY DEFINER;
+CREATE FUNCTION public.high_sdef_reads_low() RETURNS bigint
+    AS 'SELECT count(*) FROM mic_test_low' LANGUAGE sql SECURITY DEFINER;
+GRANT EXECUTE ON FUNCTION public.high_sdef_level(), public.high_sdef_reads_low() TO mic_low_user;
+SET ROLE mic_low_user;
+SELECT public.high_sdef_level();       -- high
+ high_sdef_level 
+-----------------
+ high
+(1 row)
+
+SELECT public.high_sdef_reads_low();   -- denied: a HIGH subject cannot read LOW
+ERROR:  pg_mic: read denied - high integrity subject cannot read low integrity object
+CONTEXT:  SQL function "high_sdef_reads_low" statement 1
+RESET ROLE;
+-- SET ROLE lowers both identities, so a deliberate lowering still works
+SET ROLE mic_low_user;
+SELECT mic_get_session_level();        -- low
+ mic_get_session_level 
+-----------------------
+ low
+(1 row)
+
+SELECT count(*) FROM mic_test_low;     -- allowed
+ count 
+-------
+     4
+(1 row)
+
+RESET ROLE;
+-- ============================================================
+-- Rules: lower-level code that runs as whoever touches the table
+-- ============================================================
+-- a rule's actions run with the privileges of the subject performing the
+-- triggering operation; DAC on them is checked as the rule owner
+CREATE TABLE r_rule_secret (v text);
+INSERT INTO r_rule_secret VALUES ('intact');
+GRANT UPDATE ON r_rule_secret TO mic_low_user;   -- DAC alone would let the action run
+SET ROLE mic_low_user;
+CREATE TABLE r_rule_pre (id int);
+CREATE RULE r_rule_pre_ins AS ON INSERT TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+CREATE RULE r_rule_pre_upd AS ON UPDATE TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+CREATE RULE r_rule_pre_del AS ON DELETE TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+INSERT INTO r_rule_pre VALUES (0);    -- denied: the rule's action writes a HIGH table (No Write Up)
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+SELECT integrity_level, object_name FROM mic_labels
+  WHERE object_type = 'rule' AND object_name LIKE 'r_rule_pre %' ORDER BY 2;
+ integrity_level |        object_name        
+-----------------+---------------------------
+ low             | r_rule_pre r_rule_pre_del
+ low             | r_rule_pre r_rule_pre_ins
+ low             | r_rule_pre r_rule_pre_upd
+(3 rows)
+
+-- the table is promoted; the rules on it remain LOW
+SELECT mic_promote_table('r_rule_pre', 'high');
+ mic_promote_table 
+-------------------
+ 
+(1 row)
+
+INSERT INTO r_rule_pre VALUES (1);    -- denied: LOW rule would run as HIGH
+ERROR:  pg_mic: execute denied - high integrity subject cannot fire low integrity rule on "r_rule_pre"
+UPDATE r_rule_pre SET id = 2;         -- denied (rule actions run before the UPDATE itself)
+ERROR:  pg_mic: execute denied - high integrity subject cannot fire low integrity rule on "r_rule_pre"
+DELETE FROM r_rule_pre;               -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot fire low integrity rule on "r_rule_pre"
+SELECT v FROM r_rule_secret;          -- intact
+   v    
+--------
+ intact
+(1 row)
+
+-- a rule on a HIGH relation is a write to it ...
+SET ROLE mic_low_user;
+CREATE RULE r_rule_pre_sel AS ON SELECT TO r_rule_pre DO INSTEAD SELECT 1 AS id;  -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+-- ... as is replacing a HIGH view (its ON SELECT rule) ...
+CREATE VIEW r_rule_v AS SELECT 1 AS x;
+ALTER VIEW r_rule_v OWNER TO mic_low_user;
+SET ROLE mic_low_user;
+CREATE OR REPLACE VIEW r_rule_v AS SELECT 2 AS x;   -- denied: replacing a HIGH rule
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+SELECT x FROM r_rule_v;               -- 1
+ x 
+---
+ 1
+(1 row)
+
+-- ... and a HIGH subject may not define a rule in terms of a LOW function
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+CREATE TABLE r_rule_hi (id int);
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO SELECT public.low_rule_fn();  -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_rule_fn" reached via CREATE RULE "r_rule_hi_r"
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi WHERE public.low_rule_fn() = 1 DO ALSO NOTIFY mic;  -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_rule_fn" reached via CREATE RULE "r_rule_hi_r"
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO NOTIFY mic;   -- allowed
+INSERT INTO r_rule_hi VALUES (1);     -- allowed: HIGH rule, HIGH subject
+CREATE OR REPLACE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO NOTIFY mic2;  -- allowed: same subject
+-- a higher subject re-defining a lower function makes it that subject's code
+CREATE OR REPLACE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 2' LANGUAGE sql;
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_rule_fn()';   -- high
+ integrity_level 
+-----------------
+ high
+(1 row)
+
+CREATE OR REPLACE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 3' LANGUAGE sql;  -- same subject
+SELECT public.low_rule_fn();          -- 3
+ low_rule_fn 
+-------------
+           3
+(1 row)
+
+-- ============================================================
+-- Functions and operators are objects: no write up, no read down
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_owned() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.low_owned()'::regprocedure::oid, 'high');
+ mic_promote_object 
+--------------------
+ 
+(1 row)
+
+SET ROLE mic_low_user;
+ALTER FUNCTION public.low_owned() RENAME TO low_owned2;          -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+ALTER FUNCTION public.low_owned() SET search_path = public;      -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+CREATE OR REPLACE FUNCTION public.low_owned() RETURNS int
+    AS 'SELECT 2' LANGUAGE sql;                                  -- denied: replacing a HIGH function
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+DROP FUNCTION public.low_owned();                                -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+SELECT public.low_owned();            -- 1
+ low_owned 
+-----------
+         1
+(1 row)
+
+SELECT integrity_level FROM mic_labels
+  WHERE object_name = 'low_owned()';   -- high
+ integrity_level 
+-----------------
+ high
+(1 row)
+
+-- a user-defined operator is resolved through search_path and can bind a
+-- built-in function with the wrong semantics; it is labeled and checked
+-- as an object of its own
+SET ROLE mic_low_user;
+CREATE OPERATOR public.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4ne);
+SELECT 1 === 1;                       -- allowed (LOW subject): false
+ ?column? 
+----------
+ f
+(1 row)
+
+CREATE TABLE r_op (id int CHECK (id === 0));
+RESET ROLE;
+SELECT 1 === 1;                       -- denied: LOW operator
+ERROR:  pg_mic: execute denied - high integrity subject cannot apply low integrity operator "==="
+SELECT 1 WHERE 1 === 1;               -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot apply low integrity operator "==="
+SELECT 1 WHERE 1 === ANY (ARRAY[1]);  -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot apply low integrity operator "==="
+INSERT INTO r_op VALUES (1);          -- denied: CHECK reaches the LOW operator
+ERROR:  pg_mic: execute denied - high integrity subject cannot apply low integrity operator "===" reached via CHECK constraint on "r_op"
+SET ROLE mic_low_user;
+SELECT 1 === 1;                       -- allowed
+ ?column? 
+----------
+ f
+(1 row)
+
+RESET ROLE;
+SELECT mic_promote_object('pg_catalog.pg_operator'::regclass::oid,
+                          'public.===(int, int)'::regoperator::oid, 'high');
+ mic_promote_object 
+--------------------
+ 
+(1 row)
+
+SELECT 1 === 1;                       -- allowed: false
+ ?column? 
+----------
+ f
+(1 row)
+
+DROP TABLE r_op;
+SET ROLE mic_low_user;
+DROP OPERATOR public.=== (int, int);  -- denied: HIGH operator
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+-- ============================================================
+-- Attaching code to a higher relation is a write to it
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE TABLE r_dw (id int);
+CREATE FUNCTION public.low_dw_trig() RETURNS trigger
+    AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+RESET ROLE;
+SELECT mic_promote_table('r_dw', 'high');
+ mic_promote_table 
+-------------------
+ 
+(1 row)
+
+SET ROLE mic_low_user;                -- still the owner, so DAC allows all of these
+CREATE INDEX r_dw_ix ON r_dw (id);                                        -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+CREATE TRIGGER r_dw_t BEFORE INSERT ON r_dw
+    FOR EACH ROW EXECUTE FUNCTION public.low_dw_trig();                   -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+CREATE RULE r_dw_r AS ON INSERT TO r_dw DO ALSO NOTIFY mic;               -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+CREATE POLICY r_dw_p ON r_dw USING (true);                                -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+CREATE STATISTICS r_dw_s (ndistinct) ON id, (id + 1) FROM r_dw;           -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+ALTER TABLE r_dw ADD COLUMN x int;                                        -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+ALTER TABLE r_dw ADD CHECK (id > 0);                                      -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+ALTER TABLE r_dw ALTER COLUMN id SET DEFAULT 1;                           -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+ALTER TABLE r_dw OWNER TO mic_medium_user;                                -- denied
+ERROR:  pg_mic: write denied - low integrity subject cannot write high integrity object
+RESET ROLE;
+SELECT count(*) FROM pg_attribute WHERE attrelid = 'r_dw'::regclass AND attnum > 0;  -- 1
+ count 
+-------
+     1
+(1 row)
+
+-- ============================================================
+-- Domain DEFAULT, statistics on ANALYZE, bulk labeling, extensions
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_ddef() RETURNS int AS 'BEGIN RETURN 7; END' LANGUAGE plpgsql;
+CREATE DOMAIN public.low_ddom AS int DEFAULT public.low_ddef();
+CREATE DOMAIN public.low_ddom2 AS int;
+RESET ROLE;
+CREATE TABLE r_ddef (id public.low_ddom);             -- denied: domain DEFAULT reaches a LOW function
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ddef" reached via domain DEFAULT on "r_ddef"
+CREATE DOMAIN public.hi_ddom AS int DEFAULT public.low_ddef();   -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ddef" reached via CREATE DOMAIN "hi_ddom"
+CREATE DOMAIN public.hi_ddom AS int;
+ALTER DOMAIN public.hi_ddom SET DEFAULT public.low_ddef();       -- denied
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ddef" reached via ALTER DOMAIN "hi_ddom"
+-- a LOW domain gains a LOW default after a HIGH table adopted it
+CREATE TABLE r_ddef2 (id public.low_ddom2, n int);
+SET ROLE mic_low_user;
+ALTER DOMAIN public.low_ddom2 SET DEFAULT public.low_ddef();
+RESET ROLE;
+INSERT INTO r_ddef2 (n) VALUES (1);   -- denied: the domain default would run
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_ddef" reached via domain DEFAULT on "r_ddef2"
+-- extended statistics expressions are evaluated by ANALYZE as the owner
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_stx(int) RETURNS int AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE r_stx (id int);
+INSERT INTO r_stx VALUES (1);
+CREATE STATISTICS r_stx_s ON (public.low_stx(id)), id FROM r_stx;
+RESET ROLE;
+ANALYZE r_stx;                        -- denied: statistics expression
+ERROR:  pg_mic: execute denied - high integrity subject cannot execute low integrity function "low_stx" reached via statistics expression on "r_stx"
+-- mic_initialize_labels labels each unlabeled object at its owner's level
+BEGIN;
+SECURITY LABEL FOR mic ON TABLE r_stx IS NULL;
+SECURITY LABEL FOR mic ON FUNCTION public.low_stx(int) IS NULL;
+SELECT mic_initialize_labels();       -- 2
+ mic_initialize_labels 
+-----------------------
+                     2
+(1 row)
+
+SELECT mic_get_table_level('r_stx');  -- low (owned by a LOW role)
+ mic_get_table_level 
+---------------------
+ low
+(1 row)
+
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_stx(integer)';  -- low
+ integrity_level 
+-----------------
+ low
+(1 row)
+
+ROLLBACK;
+-- mic_promote_extension refuses to promote members above their owner
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_member() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+ALTER EXTENSION pg_mic ADD FUNCTION public.low_member();
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_some;   -- WARNING: member skipped
+WARNING:  pg_mic: not promoting extension member function low_member(): its owner is below high
+ promoted_some 
+---------------
+ t
+(1 row)
+
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_member()';  -- still low
+ integrity_level 
+-----------------
+ low
+(1 row)
+
+SELECT count(*) FROM mic_labels WHERE object_type = 'extension';   -- 0: not labeled while a member was skipped
+ count 
+-------
+     0
+(1 row)
+
+ALTER EXTENSION pg_mic DROP FUNCTION public.low_member();
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_all;
+ promoted_all 
+--------------
+ t
+(1 row)
+
+SELECT object_name FROM mic_labels WHERE object_type = 'extension';   -- pg_mic
+ object_name 
+-------------
+ pg_mic
+(1 row)
+
+-- subscriptions apply rows without the DML layer: only a HIGH subject may own one
+SET ROLE mic_low_user;
+CREATE SUBSCRIPTION mic_sub CONNECTION 'dbname=nonexistent' PUBLICATION p WITH (connect = false);  -- denied
+ERROR:  pg_mic: CREATE SUBSCRIPTION requires a high integrity subject
+DETAIL:  Rows applied by logical replication are written on the subscription owner's behalf without the DML integrity checks.
+RESET ROLE;
 -- Cleanup
+DROP TABLE r_stx;
+DROP FUNCTION public.low_stx(int);
+DROP FUNCTION public.low_member();
+DROP TABLE r_ddef2;
+DROP DOMAIN public.hi_ddom;
+DROP DOMAIN public.low_ddom2;
+DROP DOMAIN public.low_ddom;
+DROP FUNCTION public.low_ddef();
+DROP TABLE r_dw;
+DROP FUNCTION public.low_dw_trig();
+DROP OPERATOR public.=== (int, int);
+DROP FUNCTION public.low_owned();
+DROP TABLE r_rule_hi;
+DROP FUNCTION public.low_rule_fn();
+DROP VIEW r_rule_v;
+DROP TABLE r_rule_pre;
+DROP TABLE r_rule_secret;
+DROP FUNCTION public.high_sdef_reads_low();
+DROP FUNCTION public.high_sdef_level();
+DROP TABLE r_srng;
+DROP TYPE public.low_sdrng;
+DROP FUNCTION public.low_sdiff(int, int);
 DROP DOMAIN public.hi_defn_dom;
 DROP TABLE r_defn_hipar;
 DROP TABLE r_defn;

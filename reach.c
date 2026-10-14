@@ -25,7 +25,10 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_policy.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_statistic_ext.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_type.h"
 #include "access/skey.h"
@@ -52,6 +55,7 @@
 typedef struct FuncCollectCtx
 {
 	List	   *funcids;
+	List	   *opnos;			/* user-defined operators applied */
 } FuncCollectCtx;
 
 static void
@@ -59,6 +63,14 @@ collect_oid(FuncCollectCtx *ctx, Oid f)
 {
 	if (OidIsValid(f))
 		ctx->funcids = lappend_oid(ctx->funcids, f);
+}
+
+/* An operator is checked as an object in its own right (see mic_planner). */
+static void
+collect_op(FuncCollectCtx *ctx, Oid opno)
+{
+	if (OidIsValid(opno) && opno >= MIC_SYSTEM_OID_THRESHOLD)
+		ctx->opnos = lappend_oid(ctx->opnos, opno);
 }
 
 /* Collect an aggregate's own function plus its support functions. */
@@ -207,6 +219,7 @@ func_collect_walker(Node *node, FuncCollectCtx *ctx)
 				Oid			f = op->opfuncid ? op->opfuncid : get_opcode(op->opno);
 
 				ctx->funcids = lappend_oid(ctx->funcids, f);
+				collect_op(ctx, op->opno);
 				break;
 			}
 		case T_ScalarArrayOpExpr:
@@ -215,6 +228,7 @@ func_collect_walker(Node *node, FuncCollectCtx *ctx)
 				Oid			f = sa->opfuncid ? sa->opfuncid : get_opcode(sa->opno);
 
 				ctx->funcids = lappend_oid(ctx->funcids, f);
+				collect_op(ctx, sa->opno);
 				break;
 			}
 		case T_Aggref:
@@ -228,7 +242,10 @@ func_collect_walker(Node *node, FuncCollectCtx *ctx)
 				ListCell   *lc;
 
 				foreach(lc, ((RowCompareExpr *) node)->opnos)
+				{
 					collect_oid(ctx, get_opcode(lfirst_oid(lc)));
+					collect_op(ctx, lfirst_oid(lc));
+				}
 				break;
 			}
 		case T_MinMaxExpr:
@@ -311,6 +328,53 @@ mic_check_one_function(Oid funcid, int subject_level,
 }
 
 /*
+ * Same rule for an operator object: a subject may not apply an operator
+ * below its level, whatever function the operator is bound to.
+ */
+void
+mic_check_one_operator(Oid opno, int subject_level,
+					   const char *via, const char *objname)
+{
+	int			objlevel;
+	char	   *opname;
+
+	if (!OidIsValid(opno) || opno < MIC_SYSTEM_OID_THRESHOLD)
+		return;					/* built-in: exempt */
+
+	objlevel = mic_get_object_level(OperatorRelationId, opno);
+	if (objlevel >= subject_level)
+		return;
+
+	opname = get_opname(opno);
+	if (opname == NULL)
+		opname = "(unknown)";
+	if (mic_debug_audit)
+		ereport(LOG,
+				(errmsg("pg_mic: execute denied - subject %s > operator %s \"%s\" (oper %u) via %s \"%s\"",
+						mic_level_to_string(subject_level),
+						mic_level_to_string(objlevel), opname, opno, via,
+						objname ? objname : "")));
+	if (mic_is_enforcing())
+	{
+		if (objname == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("pg_mic: execute denied - %s integrity subject cannot apply %s integrity operator \"%s\"",
+							mic_level_to_string(subject_level),
+							mic_level_to_string(objlevel), opname)));
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_mic: execute denied - %s integrity subject cannot apply %s integrity operator \"%s\" reached via %s \"%s\"",
+						mic_level_to_string(subject_level),
+						mic_level_to_string(objlevel), opname, via, objname)));
+	}
+	else
+		ereport(WARNING,
+				(errmsg("pg_mic: execute violation (permissive) of operator \"%s\"",
+						opname)));
+}
+
+/*
  * Function-manager entry check: the subject about to execute funcid, in
  * whatever identity the call runs, must not be above it.  This is invoked
  * for every call of every user-defined function (see mic_fmgr_hook), so it
@@ -358,7 +422,7 @@ void
 mic_check_expr_functions(Node *expr, int subject_level,
 						 const char *via, const char *objname)
 {
-	FuncCollectCtx ctx = {NIL};
+	FuncCollectCtx ctx = {NIL, NIL};
 	ListCell   *lc;
 
 	if (expr == NULL)
@@ -366,6 +430,8 @@ mic_check_expr_functions(Node *expr, int subject_level,
 	(void) func_collect_walker(expr, &ctx);
 	foreach(lc, ctx.funcids)
 		mic_check_one_function(lfirst_oid(lc), subject_level, via, objname);
+	foreach(lc, ctx.opnos)
+		mic_check_one_operator(lfirst_oid(lc), subject_level, via, objname);
 }
 
 /* CHECK constraints (relcache rd_att->constr->check[].ccbin). */
@@ -566,10 +632,23 @@ check_domain_of_type(Oid typid, int subject_level, const char *relname)
 		systable_endscan(scan);
 		table_close(conrel, AccessShareLock);
 
-		/* follow the base type (another domain, or an array/range of one) */
+		/*
+		 * The domain's DEFAULT is evaluated for any INSERT that omits a
+		 * column of this type with no default of its own; then follow the
+		 * base type (another domain, or an array/range of one).
+		 */
 		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 		if (HeapTupleIsValid(tup))
 		{
+			Datum		dval;
+			bool		dnull;
+
+			dval = SysCacheGetAttr(TYPEOID, tup, Anum_pg_type_typdefaultbin,
+								   &dnull);
+			if (!dnull)
+				mic_check_expr_functions(stringToNode(TextDatumGetCString(dval)),
+										 subject_level, "domain DEFAULT on",
+										 relname);
 			base = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
 			ReleaseSysCache(tup);
 		}
@@ -1008,15 +1087,157 @@ mic_check_matview_refresh(Oid relid)
 }
 
 /*
+ * Extended-statistics expressions (CREATE STATISTICS ... ON (expr)) are
+ * evaluated over every row by ANALYZE, which runs as the table owner.
+ */
+static void
+check_stats_exprs(Relation rel, int subject_level)
+{
+	Relation	strel;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	strel = table_open(StatisticExtRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_statistic_ext_stxrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(strel, StatisticExtRelidIndexId, true,
+							  NULL, 1, &skey);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Datum		val;
+		bool		isnull;
+
+		val = heap_getattr(tup, Anum_pg_statistic_ext_stxexprs,
+						   RelationGetDescr(strel), &isnull);
+		if (!isnull)
+			mic_check_expr_functions(stringToNode(TextDatumGetCString(val)),
+									 subject_level, "statistics expression on",
+									 RelationGetRelationName(rel));
+	}
+	systable_endscan(scan);
+	table_close(strel, AccessShareLock);
+}
+
+void
+mic_check_stats_exprs(Oid relid)
+{
+	int			subject_level;
+	Relation	rel;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+	check_stats_exprs(rel, subject_level);
+	table_close(rel, AccessShareLock);
+}
+
+/*
+ * Rules are not functions, but they are code attached to a relation that is
+ * executed, as additional queries, with the privileges of whoever performs
+ * the triggering operation; DAC on their actions is checked as the rule
+ * owner.  A rule is labeled at creation like a function, and a subject may
+ * not perform an operation whose matching rules are below its level.  Rules
+ * fire only on the relation a statement names directly (never on its
+ * inheritance children), so this is checked for the named relation alone.
+ */
+void
+mic_check_rules(Oid relid, AclMode required_ops)
+{
+	int			subject_level;
+	Relation	rel;
+	RuleLock   *rules;
+	int			i;
+
+	if (mic_mode == MIC_MODE_DISABLED)
+		return;
+
+	subject_level = mic_get_subject_level();
+	if (subject_level <= MIC_LEVEL_LOW)
+		return;
+
+	if (relid < MIC_SYSTEM_OID_THRESHOLD)
+		return;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+
+	rules = rel->rd_rules;
+	for (i = 0; rules != NULL && i < rules->numLocks; i++)
+	{
+		RewriteRule *rule = rules->rules[i];
+		bool		want = false;
+		int			objlevel;
+
+		switch (rule->event)
+		{
+			case CMD_SELECT:
+				want = (required_ops & ACL_SELECT) != 0;
+				break;
+			case CMD_INSERT:
+				want = (required_ops & ACL_INSERT) != 0;
+				break;
+			case CMD_UPDATE:
+				want = (required_ops & ACL_UPDATE) != 0;
+				break;
+			case CMD_DELETE:
+				want = (required_ops & ACL_DELETE) != 0;
+				break;
+			default:
+				break;
+		}
+		if (!want)
+			continue;
+
+		objlevel = mic_get_object_level(RewriteRelationId, rule->ruleId);
+		if (objlevel >= subject_level)
+			continue;
+
+		if (mic_debug_audit)
+			ereport(LOG,
+					(errmsg("pg_mic: execute denied - subject %s > rule %s (rule %u) on \"%s\"",
+							mic_level_to_string(subject_level),
+							mic_level_to_string(objlevel), rule->ruleId,
+							RelationGetRelationName(rel))));
+		if (mic_is_enforcing())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("pg_mic: execute denied - %s integrity subject cannot fire %s integrity rule on \"%s\"",
+							mic_level_to_string(subject_level),
+							mic_level_to_string(objlevel),
+							RelationGetRelationName(rel))));
+		else
+			ereport(WARNING,
+					(errmsg("pg_mic: execute violation (permissive) of rule on \"%s\"",
+							RelationGetRelationName(rel))));
+	}
+	table_close(rel, AccessShareLock);
+}
+
+/*
  * REINDEX SCHEMA / DATABASE rebuilds every index under one command, so expand
  * the target to the affected user relations and check each one's stored index
  * expressions/predicates against the invoking subject.  nspoid restricts to a
  * single schema (REINDEX SCHEMA); InvalidOid covers the whole database
  * (REINDEX DATABASE).  System catalogs (OID below the threshold) are exempt,
  * so REINDEX SYSTEM has nothing user-defined to check and never calls here.
+ * stats adds the extended-statistics expressions, for the commands that
+ * ANALYZE (a bare VACUUM or CLUSTER).
  */
 void
-mic_check_reindex_relations(Oid nspoid)
+mic_check_reindex_relations(Oid nspoid, bool stats)
 {
 	int			subject_level;
 	Relation	classrel;
@@ -1050,6 +1271,8 @@ mic_check_reindex_relations(Oid nspoid)
 		if (rel == NULL)
 			continue;
 		check_index_exprs(rel, subject_level);
+		if (stats)
+			check_stats_exprs(rel, subject_level);
 		table_close(rel, AccessShareLock);
 	}
 	systable_endscan(scan);

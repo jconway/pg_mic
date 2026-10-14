@@ -664,7 +664,229 @@ SELECT mic_promote_extension('pg_mic', 'high');   -- ERROR: superuser only
 RESET ROLE;
 SELECT mic_promote_extension('pg_mic', 'bogus');  -- ERROR: invalid level
 
+-- ============================================================
+-- Subject identity: an owner switch never lowers the subject
+-- ============================================================
+-- fmgr_security_definer switches to the function owner before fmgr_hook
+-- runs; the subject is the higher of the outer and current user, so a LOW
+-- SECURITY DEFINER function is still LOW code run by a HIGH subject
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_sdiff(a int, b int) RETURNS float8
+    AS 'BEGIN RETURN (a - b)::float8; END' LANGUAGE plpgsql IMMUTABLE
+    SECURITY DEFINER;
+CREATE TYPE public.low_sdrng AS RANGE (subtype = int, subtype_diff = public.low_sdiff);
+RESET ROLE;
+CREATE TABLE r_srng (r public.low_sdrng);
+CREATE INDEX r_srng_gist ON r_srng USING gist (r);
+INSERT INTO r_srng
+  SELECT format('[%s,%s)', g, g + 5)::public.low_sdrng
+    FROM generate_series(1, 300) g;    -- denied: SECURITY DEFINER does not launder the owner
+-- inside a HIGH SECURITY DEFINER function the subject is HIGH, whoever calls it
+CREATE FUNCTION public.high_sdef_level() RETURNS text
+    AS 'SELECT mic_get_session_level()' LANGUAGE sql SECURITY DEFINER;
+CREATE FUNCTION public.high_sdef_reads_low() RETURNS bigint
+    AS 'SELECT count(*) FROM mic_test_low' LANGUAGE sql SECURITY DEFINER;
+GRANT EXECUTE ON FUNCTION public.high_sdef_level(), public.high_sdef_reads_low() TO mic_low_user;
+SET ROLE mic_low_user;
+SELECT public.high_sdef_level();       -- high
+SELECT public.high_sdef_reads_low();   -- denied: a HIGH subject cannot read LOW
+RESET ROLE;
+-- SET ROLE lowers both identities, so a deliberate lowering still works
+SET ROLE mic_low_user;
+SELECT mic_get_session_level();        -- low
+SELECT count(*) FROM mic_test_low;     -- allowed
+RESET ROLE;
+
+-- ============================================================
+-- Rules: lower-level code that runs as whoever touches the table
+-- ============================================================
+-- a rule's actions run with the privileges of the subject performing the
+-- triggering operation; DAC on them is checked as the rule owner
+CREATE TABLE r_rule_secret (v text);
+INSERT INTO r_rule_secret VALUES ('intact');
+GRANT UPDATE ON r_rule_secret TO mic_low_user;   -- DAC alone would let the action run
+SET ROLE mic_low_user;
+CREATE TABLE r_rule_pre (id int);
+CREATE RULE r_rule_pre_ins AS ON INSERT TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+CREATE RULE r_rule_pre_upd AS ON UPDATE TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+CREATE RULE r_rule_pre_del AS ON DELETE TO r_rule_pre
+    DO ALSO UPDATE r_rule_secret SET v = 'tampered';
+INSERT INTO r_rule_pre VALUES (0);    -- denied: the rule's action writes a HIGH table (No Write Up)
+RESET ROLE;
+SELECT integrity_level, object_name FROM mic_labels
+  WHERE object_type = 'rule' AND object_name LIKE 'r_rule_pre %' ORDER BY 2;
+-- the table is promoted; the rules on it remain LOW
+SELECT mic_promote_table('r_rule_pre', 'high');
+INSERT INTO r_rule_pre VALUES (1);    -- denied: LOW rule would run as HIGH
+UPDATE r_rule_pre SET id = 2;         -- denied (rule actions run before the UPDATE itself)
+DELETE FROM r_rule_pre;               -- denied
+SELECT v FROM r_rule_secret;          -- intact
+-- a rule on a HIGH relation is a write to it ...
+SET ROLE mic_low_user;
+CREATE RULE r_rule_pre_sel AS ON SELECT TO r_rule_pre DO INSTEAD SELECT 1 AS id;  -- denied
+RESET ROLE;
+-- ... as is replacing a HIGH view (its ON SELECT rule) ...
+CREATE VIEW r_rule_v AS SELECT 1 AS x;
+ALTER VIEW r_rule_v OWNER TO mic_low_user;
+SET ROLE mic_low_user;
+CREATE OR REPLACE VIEW r_rule_v AS SELECT 2 AS x;   -- denied: replacing a HIGH rule
+RESET ROLE;
+SELECT x FROM r_rule_v;               -- 1
+-- ... and a HIGH subject may not define a rule in terms of a LOW function
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+CREATE TABLE r_rule_hi (id int);
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO SELECT public.low_rule_fn();  -- denied
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi WHERE public.low_rule_fn() = 1 DO ALSO NOTIFY mic;  -- denied
+CREATE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO NOTIFY mic;   -- allowed
+INSERT INTO r_rule_hi VALUES (1);     -- allowed: HIGH rule, HIGH subject
+CREATE OR REPLACE RULE r_rule_hi_r AS ON INSERT TO r_rule_hi DO ALSO NOTIFY mic2;  -- allowed: same subject
+-- a higher subject re-defining a lower function makes it that subject's code
+CREATE OR REPLACE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 2' LANGUAGE sql;
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_rule_fn()';   -- high
+CREATE OR REPLACE FUNCTION public.low_rule_fn() RETURNS int AS 'SELECT 3' LANGUAGE sql;  -- same subject
+SELECT public.low_rule_fn();          -- 3
+
+-- ============================================================
+-- Functions and operators are objects: no write up, no read down
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_owned() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+SELECT mic_promote_object('pg_catalog.pg_proc'::regclass::oid,
+                          'public.low_owned()'::regprocedure::oid, 'high');
+SET ROLE mic_low_user;
+ALTER FUNCTION public.low_owned() RENAME TO low_owned2;          -- denied
+ALTER FUNCTION public.low_owned() SET search_path = public;      -- denied
+CREATE OR REPLACE FUNCTION public.low_owned() RETURNS int
+    AS 'SELECT 2' LANGUAGE sql;                                  -- denied: replacing a HIGH function
+DROP FUNCTION public.low_owned();                                -- denied
+RESET ROLE;
+SELECT public.low_owned();            -- 1
+SELECT integrity_level FROM mic_labels
+  WHERE object_name = 'low_owned()';   -- high
+-- a user-defined operator is resolved through search_path and can bind a
+-- built-in function with the wrong semantics; it is labeled and checked
+-- as an object of its own
+SET ROLE mic_low_user;
+CREATE OPERATOR public.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4ne);
+SELECT 1 === 1;                       -- allowed (LOW subject): false
+CREATE TABLE r_op (id int CHECK (id === 0));
+RESET ROLE;
+SELECT 1 === 1;                       -- denied: LOW operator
+SELECT 1 WHERE 1 === 1;               -- denied
+SELECT 1 WHERE 1 === ANY (ARRAY[1]);  -- denied
+INSERT INTO r_op VALUES (1);          -- denied: CHECK reaches the LOW operator
+SET ROLE mic_low_user;
+SELECT 1 === 1;                       -- allowed
+RESET ROLE;
+SELECT mic_promote_object('pg_catalog.pg_operator'::regclass::oid,
+                          'public.===(int, int)'::regoperator::oid, 'high');
+SELECT 1 === 1;                       -- allowed: false
+DROP TABLE r_op;
+SET ROLE mic_low_user;
+DROP OPERATOR public.=== (int, int);  -- denied: HIGH operator
+RESET ROLE;
+
+-- ============================================================
+-- Attaching code to a higher relation is a write to it
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE TABLE r_dw (id int);
+CREATE FUNCTION public.low_dw_trig() RETURNS trigger
+    AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+RESET ROLE;
+SELECT mic_promote_table('r_dw', 'high');
+SET ROLE mic_low_user;                -- still the owner, so DAC allows all of these
+CREATE INDEX r_dw_ix ON r_dw (id);                                        -- denied
+CREATE TRIGGER r_dw_t BEFORE INSERT ON r_dw
+    FOR EACH ROW EXECUTE FUNCTION public.low_dw_trig();                   -- denied
+CREATE RULE r_dw_r AS ON INSERT TO r_dw DO ALSO NOTIFY mic;               -- denied
+CREATE POLICY r_dw_p ON r_dw USING (true);                                -- denied
+CREATE STATISTICS r_dw_s (ndistinct) ON id, (id + 1) FROM r_dw;           -- denied
+ALTER TABLE r_dw ADD COLUMN x int;                                        -- denied
+ALTER TABLE r_dw ADD CHECK (id > 0);                                      -- denied
+ALTER TABLE r_dw ALTER COLUMN id SET DEFAULT 1;                           -- denied
+ALTER TABLE r_dw OWNER TO mic_medium_user;                                -- denied
+RESET ROLE;
+SELECT count(*) FROM pg_attribute WHERE attrelid = 'r_dw'::regclass AND attnum > 0;  -- 1
+
+-- ============================================================
+-- Domain DEFAULT, statistics on ANALYZE, bulk labeling, extensions
+-- ============================================================
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_ddef() RETURNS int AS 'BEGIN RETURN 7; END' LANGUAGE plpgsql;
+CREATE DOMAIN public.low_ddom AS int DEFAULT public.low_ddef();
+CREATE DOMAIN public.low_ddom2 AS int;
+RESET ROLE;
+CREATE TABLE r_ddef (id public.low_ddom);             -- denied: domain DEFAULT reaches a LOW function
+CREATE DOMAIN public.hi_ddom AS int DEFAULT public.low_ddef();   -- denied
+CREATE DOMAIN public.hi_ddom AS int;
+ALTER DOMAIN public.hi_ddom SET DEFAULT public.low_ddef();       -- denied
+-- a LOW domain gains a LOW default after a HIGH table adopted it
+CREATE TABLE r_ddef2 (id public.low_ddom2, n int);
+SET ROLE mic_low_user;
+ALTER DOMAIN public.low_ddom2 SET DEFAULT public.low_ddef();
+RESET ROLE;
+INSERT INTO r_ddef2 (n) VALUES (1);   -- denied: the domain default would run
+-- extended statistics expressions are evaluated by ANALYZE as the owner
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_stx(int) RETURNS int AS 'BEGIN RETURN $1; END' LANGUAGE plpgsql IMMUTABLE;
+CREATE TABLE r_stx (id int);
+INSERT INTO r_stx VALUES (1);
+CREATE STATISTICS r_stx_s ON (public.low_stx(id)), id FROM r_stx;
+RESET ROLE;
+ANALYZE r_stx;                        -- denied: statistics expression
+-- mic_initialize_labels labels each unlabeled object at its owner's level
+BEGIN;
+SECURITY LABEL FOR mic ON TABLE r_stx IS NULL;
+SECURITY LABEL FOR mic ON FUNCTION public.low_stx(int) IS NULL;
+SELECT mic_initialize_labels();       -- 2
+SELECT mic_get_table_level('r_stx');  -- low (owned by a LOW role)
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_stx(integer)';  -- low
+ROLLBACK;
+-- mic_promote_extension refuses to promote members above their owner
+SET ROLE mic_low_user;
+CREATE FUNCTION public.low_member() RETURNS int AS 'SELECT 1' LANGUAGE sql;
+RESET ROLE;
+ALTER EXTENSION pg_mic ADD FUNCTION public.low_member();
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_some;   -- WARNING: member skipped
+SELECT integrity_level FROM mic_labels WHERE object_name = 'low_member()';  -- still low
+SELECT count(*) FROM mic_labels WHERE object_type = 'extension';   -- 0: not labeled while a member was skipped
+ALTER EXTENSION pg_mic DROP FUNCTION public.low_member();
+SELECT mic_promote_extension('pg_mic', 'high') > 0 AS promoted_all;
+SELECT object_name FROM mic_labels WHERE object_type = 'extension';   -- pg_mic
+-- subscriptions apply rows without the DML layer: only a HIGH subject may own one
+SET ROLE mic_low_user;
+CREATE SUBSCRIPTION mic_sub CONNECTION 'dbname=nonexistent' PUBLICATION p WITH (connect = false);  -- denied
+RESET ROLE;
+
 -- Cleanup
+DROP TABLE r_stx;
+DROP FUNCTION public.low_stx(int);
+DROP FUNCTION public.low_member();
+DROP TABLE r_ddef2;
+DROP DOMAIN public.hi_ddom;
+DROP DOMAIN public.low_ddom2;
+DROP DOMAIN public.low_ddom;
+DROP FUNCTION public.low_ddef();
+DROP TABLE r_dw;
+DROP FUNCTION public.low_dw_trig();
+DROP OPERATOR public.=== (int, int);
+DROP FUNCTION public.low_owned();
+DROP TABLE r_rule_hi;
+DROP FUNCTION public.low_rule_fn();
+DROP VIEW r_rule_v;
+DROP TABLE r_rule_pre;
+DROP TABLE r_rule_secret;
+DROP FUNCTION public.high_sdef_reads_low();
+DROP FUNCTION public.high_sdef_level();
+DROP TABLE r_srng;
+DROP TYPE public.low_sdrng;
+DROP FUNCTION public.low_sdiff(int, int);
 DROP DOMAIN public.hi_defn_dom;
 DROP TABLE r_defn_hipar;
 DROP TABLE r_defn;

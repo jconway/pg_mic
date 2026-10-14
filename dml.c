@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "executor/executor.h"
@@ -22,6 +23,8 @@
 #include "pg_mic.h"
 #include "pg_mic_compat.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 /*
  * mic_perm_entries
@@ -93,7 +96,7 @@ mic_check_one_relation(Oid relOid, AclMode requiredPerms,
  * triggers, constraints, defaults and index expressions attached to the
  * children run just the same -- INSERT routes rows into partitions, and
  * UPDATE/DELETE/SELECT scan every child -- so the children must be analyzed
- * too.
+ * too.  Rules, by contrast, fire only on the relation named.
  */
 static void
 mic_check_relation_tree(MicPermEntry *perminfo, bool need_read, bool need_write)
@@ -106,11 +109,57 @@ mic_check_relation_tree(MicPermEntry *perminfo, bool need_read, bool need_write)
 		perminfo->relid < MIC_SYSTEM_OID_THRESHOLD)
 		return;
 
+	/*
+	 * A LOW subject reading: nothing is below LOW, so neither the read
+	 * check nor any reachable-code check can fail.  Skip the tree walk and
+	 * the locks it takes on every child.
+	 */
+	if (!need_write && mic_get_subject_level() <= MIC_LEVEL_LOW)
+		return;
+
+	mic_check_rules(perminfo->relid, perminfo->requiredPerms);
+
 	rels = mic_relation_tree(perminfo->relid, perminfo->inh);
 	foreach(lc, rels)
 		mic_check_one_relation(lfirst_oid(lc), perminfo->requiredPerms,
 							   need_read, need_write);
 	list_free(rels);
+}
+
+/*
+ * Run the checks for one entry without letting a denial escape as an error:
+ * the executor asks for this (abort = false) when it only wants to know
+ * whether a fast path is permitted, e.g. RI_Initial_Check.  The checks open
+ * relations and catalog scans, so they must run in a subtransaction that a
+ * denial rolls back; FlushErrorState alone would leak those resources.
+ */
+static bool
+mic_check_relation_tree_soft(MicPermEntry *perminfo, bool need_read,
+							 bool need_write)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	bool		ok = true;
+
+	BeginInternalSubTransaction(NULL);
+	PG_TRY();
+	{
+		mic_check_relation_tree(perminfo, need_read, need_write);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		ok = false;
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(oldcxt);
+	CurrentResourceOwner = oldowner;
+
+	return ok;
 }
 
 /*
@@ -161,22 +210,12 @@ mic_dml_privileges(List *perm_entries, bool abort_on_violation)
 
 		/*
 		 * Apply Biba checks.  We use abort_on_violation from the caller
-		 * to decide whether to ERROR or just return false.  However, our
-		 * check functions always ereport, so we wrap them in PG_TRY if
-		 * we need soft failure.
+		 * to decide whether to ERROR or just return false.
 		 */
 		if (!abort_on_violation)
 		{
-			PG_TRY();
-			{
-				mic_check_relation_tree(perminfo, need_read, need_write);
-			}
-			PG_CATCH();
-			{
-				FlushErrorState();
+			if (!mic_check_relation_tree_soft(perminfo, need_read, need_write))
 				return false;
-			}
-			PG_END_TRY();
 		}
 		else
 			mic_check_relation_tree(perminfo, need_read, need_write);
